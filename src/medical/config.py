@@ -196,8 +196,9 @@ class APIConfig:
     RETRY_DELAY = 1  # seconds
 
     # Response pagination
-    DEFAULT_PAGE_SIZE = 100
-    MAX_PAGE_SIZE = 500
+    MIN_PAGE_SIZE = 10  # API minimum requirement
+    DEFAULT_PAGE_SIZE = 10  # Use conservative page size
+    MAX_PAGE_SIZE = 50  # PNCP API maximum supported
 
 # Utility functions
 def get_state_name(state_code: str) -> str:

@@ -5,6 +5,7 @@ Handles database connections, schema creation, and data operations
 
 import os
 import logging
+import json
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 import asyncio
@@ -51,14 +52,21 @@ class CloudSQLManager:
 
     async def get_connection(self):
         """Get async database connection using Cloud SQL connector"""
+        # Check if password is provided - if so, use password auth
+        db_password = os.getenv('DB_PASSWORD', '')
+        use_password_auth = bool(db_password)
+
+        # Check USE_PRIVATE_IP from env first, then config
+        use_private_ip = os.getenv('USE_PRIVATE_IP', 'false').lower() == 'true'
+
         return await self.connector.connect_async(
             instance_connection_string=self.connection_name,
             driver="asyncpg",
-            user=os.getenv('DB_USER', 'postgres') if not DatabaseConfig.USE_IAM_AUTH else None,
-            password=os.getenv('DB_PASSWORD', '') if not DatabaseConfig.USE_IAM_AUTH else None,
-            database=self.database_name,
-            enable_iam_auth=DatabaseConfig.USE_IAM_AUTH,
-            ip_type="private" if os.getenv('USE_PRIVATE_IP', 'true').lower() == 'true' else "public"
+            user=os.getenv('DB_USER', 'postgres'),
+            password=db_password if use_password_auth else None,
+            db=self.database_name,
+            enable_iam_auth=not use_password_auth,
+            ip_type="private" if use_private_ip else "public"
         )
 
     def create_sync_engine(self):
@@ -351,6 +359,49 @@ class DatabaseOperations:
         finally:
             await conn.close()
 
+    async def filter_new_tenders(self, tenders: List[Dict]) -> List[Dict]:
+        """Filter out tenders already in database (by control_number)"""
+        if not tenders:
+            return []
+
+        conn = await self.db_manager.get_connection()
+        try:
+            # Extract all control numbers from tenders
+            control_numbers = [
+                t.get('numeroControlePNCP') or t.get('numeroControlePNCPCompra') or t.get('control_number')
+                for t in tenders
+            ]
+            # Filter out None values
+            control_numbers = [cn for cn in control_numbers if cn]
+
+            if not control_numbers:
+                return tenders
+
+            # Query database for existing control numbers
+            query = """
+                SELECT control_number
+                FROM tenders
+                WHERE control_number = ANY($1::varchar[])
+            """
+            existing_rows = await conn.fetch(query, control_numbers)
+            existing_control_numbers = {row['control_number'] for row in existing_rows}
+
+            # Filter out tenders that already exist
+            new_tenders = []
+            for tender in tenders:
+                control_num = (
+                    tender.get('numeroControlePNCP') or
+                    tender.get('numeroControlePNCPCompra') or
+                    tender.get('control_number')
+                )
+                if control_num not in existing_control_numbers:
+                    new_tenders.append(tender)
+
+            return new_tenders
+
+        finally:
+            await conn.close()
+
     async def get_unprocessed_tenders(self, state_code: str = None, limit: int = 100) -> List[Dict]:
         """Get tenders that haven't been processed for item extraction"""
         conn = await self.db_manager.get_connection()
@@ -382,11 +433,14 @@ class DatabaseOperations:
         """Log start of processing operation"""
         conn = await self.db_manager.get_connection()
         try:
+            # Convert metadata dict to JSON string for JSONB column
+            metadata_json = json.dumps(metadata) if metadata else None
+
             log_id = await conn.fetchval("""
                 INSERT INTO processing_log (process_type, state_code, start_time, status, metadata)
-                VALUES ($1, $2, CURRENT_TIMESTAMP, 'running', $3)
+                VALUES ($1, $2, CURRENT_TIMESTAMP, 'running', $3::jsonb)
                 RETURNING id
-            """, process_type, state_code, metadata)
+            """, process_type, state_code, metadata_json)
             return log_id
         finally:
             await conn.close()

@@ -175,8 +175,10 @@ class PNCPAPIClient:
 
     async def authenticate(self) -> bool:
         """Authenticate with PNCP API and get bearer token"""
+        # PNCP public API may not require authentication for consultation endpoints
         if not self.username or not self.password:
-            raise ValueError("Username and password required for authentication")
+            logger.info("No credentials provided - using public API access")
+            return True  # Allow public access
 
         login_url = f"{self.base_url}{APIConfig.LOGIN_ENDPOINT}"
         login_data = {
@@ -223,18 +225,25 @@ class PNCPAPIClient:
                                             modality_code: int, state: str = None,
                                             municipality_code: str = None,
                                             cnpj: str = None, page: int = 1,
-                                            page_size: int = 100) -> Tuple[int, Dict[str, Any]]:
+                                            page_size: int = 10) -> Tuple[int, Dict[str, Any]]:
         """Get tenders by publication date using consultation API"""
 
         url = f"{self.consultation_url}/v1/contratacoes/publicacao"
+
+        # Validate page size (PNCP requires 10-500)
+        validated_page_size = max(APIConfig.MIN_PAGE_SIZE, min(page_size, APIConfig.MAX_PAGE_SIZE))
+
+        logger.debug(f"API call - page_size input: {page_size}, validated: {validated_page_size}")
 
         params = {
             'dataInicial': start_date,
             'dataFinal': end_date,
             'codigoModalidadeContratacao': modality_code,
             'pagina': page,
-            'tamanhoPagina': min(page_size, APIConfig.MAX_PAGE_SIZE)
+            'tamanhoPagina': validated_page_size
         }
+
+        logger.debug(f"API params: {params}")
 
         if state:
             params['uf'] = state
@@ -247,23 +256,47 @@ class PNCPAPIClient:
 
     async def get_tender_items(self, cnpj: str, year: int, sequential: int) -> Tuple[int, Dict[str, Any]]:
         """Get all items for a specific tender"""
-        if not self.auth_token or self.auth_token.is_expired():
-            authenticated = await self.authenticate()
-            if not authenticated:
-                return 401, {'error': 'Authentication failed'}
+        # Try to authenticate if credentials provided, otherwise use public access
+        if self.username and self.password:
+            if not self.auth_token or self.auth_token.is_expired():
+                authenticated = await self.authenticate()
+                if not authenticated:
+                    return 401, {'error': 'Authentication failed'}
 
         url = f"{self.base_url}/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens"
         headers = self._get_auth_headers()
 
         return await self._make_request('GET', url, headers=headers)
 
+    async def fetch_sample_items(self, cnpj: str, year: int, sequential: int, max_items: int = 3) -> List[Dict[str, Any]]:
+        """
+        Fetch only first N items from a tender (for sampling in Stage 3)
+        This saves API calls by not fetching all items
+        """
+        try:
+            status, response = await self.get_tender_items(cnpj, year, sequential)
+
+            if status == 200:
+                items = response.get('data', [])
+                # Return only first max_items
+                return items[:max_items]
+            else:
+                logger.warning(f"Failed to fetch items for {cnpj}/{year}/{sequential}: {status}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error fetching sample items: {e}")
+            return []
+
     async def get_item_results(self, cnpj: str, year: int, sequential: int,
                              item_number: int) -> Tuple[int, Dict[str, Any]]:
         """Get results (bids) for a specific item"""
-        if not self.auth_token or self.auth_token.is_expired():
-            authenticated = await self.authenticate()
-            if not authenticated:
-                return 401, {'error': 'Authentication failed'}
+        # Try to authenticate if credentials provided, otherwise use public access
+        if self.username and self.password:
+            if not self.auth_token or self.auth_token.is_expired():
+                authenticated = await self.authenticate()
+                if not authenticated:
+                    return 401, {'error': 'Authentication failed'}
 
         url = f"{self.base_url}/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens/{item_number}/resultados"
         headers = self._get_auth_headers()
@@ -273,19 +306,111 @@ class PNCPAPIClient:
     async def get_specific_item_result(self, cnpj: str, year: int, sequential: int,
                                      item_number: int, result_sequential: int) -> Tuple[int, Dict[str, Any]]:
         """Get specific result details for an item"""
-        if not self.auth_token or self.auth_token.is_expired():
-            authenticated = await self.authenticate()
-            if not authenticated:
-                return 401, {'error': 'Authentication failed'}
+        # Try to authenticate if credentials provided, otherwise use public access
+        if self.username and self.password:
+            if not self.auth_token or self.auth_token.is_expired():
+                authenticated = await self.authenticate()
+                if not authenticated:
+                    return 401, {'error': 'Authentication failed'}
 
         url = f"{self.base_url}/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens/{item_number}/resultados/{result_sequential}"
         headers = self._get_auth_headers()
 
         return await self._make_request('GET', url, headers=headers)
 
+    async def get_ongoing_tenders_by_status(self, start_date: str, end_date: str,
+                                          modality_code: int, state: str = None,
+                                          page: int = 1, page_size: int = 10) -> Tuple[int, Dict[str, Any]]:
+        """
+        Get ongoing tenders (not completed) by checking status and dates
+        Focuses on tenders that are currently open for bidding
+        """
+        url = f"{self.consultation_url}/v1/contratacoes/publicacao"
+
+        # Validate page size (PNCP requires 10-500)
+        validated_page_size = max(APIConfig.MIN_PAGE_SIZE, min(page_size, APIConfig.MAX_PAGE_SIZE))
+
+        logger.debug(f"API call (ongoing) - page_size input: {page_size}, validated: {validated_page_size}")
+
+        params = {
+            'dataInicial': start_date,
+            'dataFinal': end_date,
+            'codigoModalidadeContratacao': modality_code,
+            'pagina': page,
+            'tamanhoPagina': validated_page_size
+        }
+
+        logger.debug(f"API params (ongoing): {params}")
+
+        if state:
+            params['uf'] = state
+
+        # Note: PNCP API may not have a direct status filter, so we'll need to filter results
+        # after retrieving them to check for ongoing status
+        return await self._make_request('GET', url, params=params)
+
+    def filter_ongoing_tenders(self, tenders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter tenders to keep only ongoing ones (not completed/homologated)
+        """
+        ongoing_status_keywords = [
+            'aberta', 'open', 'em andamento', 'in progress',
+            'publicada', 'published', 'vigente', 'active',
+            'aguardando propostas', 'recebendo propostas'
+        ]
+
+        completed_status_keywords = [
+            'homologada', 'homologado', 'homologated',
+            'concluída', 'concluido', 'concluded', 'completed',
+            'adjudicada', 'adjudicado', 'finalizada', 'finalizado',
+            'cancelada', 'cancelado', 'deserta', 'fracassada'
+        ]
+
+        filtered_tenders = []
+
+        for tender in tenders:
+            # Check status field
+            status = (
+                tender.get('situacaoCompra', '') or
+                tender.get('situacao', '') or
+                tender.get('statusCompra', '') or
+                tender.get('status', '')
+            ).lower()
+
+            # Check if completed (exclude these)
+            is_completed = any(keyword in status for keyword in completed_status_keywords)
+            if is_completed:
+                continue
+
+            # Check if ongoing (or unknown status with recent date)
+            is_ongoing = any(keyword in status for keyword in ongoing_status_keywords)
+
+            # If no clear status, check dates
+            if not is_ongoing and not status:
+                # If has publication date but no homologation date, likely ongoing
+                has_pub_date = tender.get('dataPublicacao') or tender.get('dataPublicacaoPncp')
+                has_homolog_date = tender.get('dataHomologacao') or tender.get('dataResultado')
+
+                if has_pub_date and not has_homolog_date:
+                    is_ongoing = True
+
+            if is_ongoing:
+                filtered_tenders.append(tender)
+
+        return filtered_tenders
+
     async def discover_tenders_for_state(self, state_code: str, start_date: str, end_date: str,
-                                       modalities: List[int] = None) -> List[Dict[str, Any]]:
-        """Discover all tenders for a specific state within date range"""
+                                       modalities: List[int] = None, only_ongoing: bool = False) -> List[Dict[str, Any]]:
+        """
+        Discover all tenders for a specific state within date range
+
+        Args:
+            state_code: State code (e.g., 'SP', 'RJ')
+            start_date: Start date in YYYYMMDD format
+            end_date: End date in YYYYMMDD format
+            modalities: List of modality codes (default: [4, 6, 8])
+            only_ongoing: If True, filter for ongoing tenders only
+        """
         if modalities is None:
             modalities = [4, 6, 8]  # Electronic tenders, Pregão, Dispensa
 
@@ -297,13 +422,22 @@ class PNCPAPIClient:
 
             while has_more:
                 try:
-                    status, response = await self.get_tenders_by_publication_date(
-                        start_date, end_date, modality, state_code, page=page
-                    )
+                    if only_ongoing:
+                        status, response = await self.get_ongoing_tenders_by_status(
+                            start_date, end_date, modality, state_code, page=page, page_size=50
+                        )
+                    else:
+                        status, response = await self.get_tenders_by_publication_date(
+                            start_date, end_date, modality, state_code, page=page, page_size=50
+                        )
 
                     if status == 200:
                         data = response.get('data', [])
                         if data:
+                            # Filter for ongoing if requested
+                            if only_ongoing:
+                                data = self.filter_ongoing_tenders(data)
+
                             all_tenders.extend(data)
 
                             # Check if there are more pages
@@ -325,7 +459,7 @@ class PNCPAPIClient:
                     logger.error(f"Error getting tenders for {state_code}: {e}")
                     has_more = False
 
-        logger.info(f"Discovered {len(all_tenders)} tenders for {state_code}")
+        logger.info(f"Discovered {len(all_tenders)} tenders for {state_code} (ongoing_only={only_ongoing})")
         return all_tenders
 
     async def get_complete_tender_data(self, cnpj: str, year: int, sequential: int) -> Dict[str, Any]:

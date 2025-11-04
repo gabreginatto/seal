@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+"""
+Simple schema creation - creates tables if they don't exist
+Uses CREATE TABLE IF NOT EXISTS to avoid conflicts
+"""
+
+import asyncio
+import os
+from dotenv import load_dotenv
+from google.cloud.sql.connector import Connector
+
+load_dotenv()
+
+# Simple schema statements
+SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS organizations (
+        id SERIAL PRIMARY KEY,
+        cnpj VARCHAR(18) UNIQUE NOT NULL,
+        name VARCHAR(500) NOT NULL,
+        government_level VARCHAR(50) NOT NULL,
+        organization_type VARCHAR(50),
+        state_code VARCHAR(2),
+        municipality_name VARCHAR(200),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tenders (
+        id SERIAL PRIMARY KEY,
+        organization_id INTEGER REFERENCES organizations(id),
+        cnpj VARCHAR(18) NOT NULL,
+        ano INTEGER NOT NULL,
+        sequencial INTEGER NOT NULL,
+        control_number VARCHAR(50) UNIQUE,
+        title VARCHAR(1000),
+        description TEXT,
+        government_level VARCHAR(50) NOT NULL,
+        tender_size VARCHAR(20) NOT NULL,
+        contracting_modality INTEGER,
+        modality_name VARCHAR(100),
+        total_estimated_value DECIMAL(15,2),
+        total_homologated_value DECIMAL(15,2),
+        publication_date DATE,
+        state_code VARCHAR(2),
+        municipality_code VARCHAR(10),
+        status VARCHAR(50) DEFAULT 'discovered',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tender_items (
+        id SERIAL PRIMARY KEY,
+        tender_id INTEGER REFERENCES tenders(id),
+        item_number INTEGER,
+        description TEXT,
+        quantity DECIMAL(15,3),
+        unit VARCHAR(50),
+        unit_price DECIMAL(15,2),
+        total_price DECIMAL(15,2),
+        matched_product_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS matched_products (
+        id SERIAL PRIMARY KEY,
+        tender_item_id INTEGER REFERENCES tender_items(id),
+        product_code VARCHAR(100),
+        product_name VARCHAR(500),
+        match_score DECIMAL(5,2),
+        fob_price_usd DECIMAL(15,2),
+        fob_price_brl DECIMAL(15,2),
+        price_difference_pct DECIMAL(5,2),
+        is_competitive BOOLEAN,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_log (
+        id SERIAL PRIMARY KEY,
+        process_type VARCHAR(100),
+        state_code VARCHAR(2),
+        status VARCHAR(50),
+        records_processed INTEGER DEFAULT 0,
+        records_matched INTEGER DEFAULT 0,
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP,
+        error_message TEXT,
+        metadata JSONB
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS homologated_results (
+        id SERIAL PRIMARY KEY,
+        tender_id INTEGER REFERENCES tenders(id),
+        item_number INTEGER,
+        supplier_cnpj VARCHAR(18),
+        supplier_name VARCHAR(500),
+        homologated_unit_price DECIMAL(15,2),
+        homologated_quantity DECIMAL(15,3),
+        homologated_total_price DECIMAL(15,2),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+]
+
+async def create_schema():
+    """Create database schema"""
+
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    region = os.getenv('CLOUD_SQL_REGION')
+    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
+    database_name = os.getenv('DATABASE_NAME')
+
+    connection_name = f"{project_id}:{region}:{instance_name}"
+
+    print("=" * 70)
+    print("Creating Database Schema")
+    print("=" * 70)
+    print(f"\nConnection: {connection_name}")
+    print(f"Database: {database_name}")
+
+    connector = Connector()
+
+    try:
+        print("\n1️⃣  Connecting to Cloud SQL...")
+        conn = await connector.connect_async(
+            instance_connection_string=connection_name,
+            driver="asyncpg",
+            user=os.getenv('DB_USER'),
+            db="postgres",  # Connect to postgres database first
+            enable_iam_auth=True,
+            ip_type="public"
+        )
+        print("   ✅ Connected to postgres database")
+
+        # Check if our database exists
+        print(f"\n2️⃣  Checking if database '{database_name}' exists...")
+        exists = await conn.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1",
+            database_name
+        )
+
+        if not exists:
+            print(f"   Creating database '{database_name}'...")
+            # Need to close current connection to create database
+            await conn.close()
+
+            # Reconnect and create
+            conn = await connector.connect_async(
+                instance_connection_string=connection_name,
+                driver="asyncpg",
+                user=os.getenv('DB_USER'),
+                db="postgres",
+                enable_iam_auth=True,
+                ip_type="public"
+            )
+
+            await conn.execute(f'CREATE DATABASE {database_name}')
+            print(f"   ✅ Database created")
+        else:
+            print(f"   ✅ Database exists")
+
+        await conn.close()
+
+        # Now connect to our database and create tables
+        print(f"\n3️⃣  Connecting to '{database_name}'...")
+        conn = await connector.connect_async(
+            instance_connection_string=connection_name,
+            driver="asyncpg",
+            user=os.getenv('DB_USER'),
+            db=database_name,
+            enable_iam_auth=True,
+            ip_type="public"
+        )
+        print("   ✅ Connected")
+
+        print("\n4️⃣  Creating tables...")
+        table_names = ['organizations', 'tenders', 'tender_items', 'matched_products', 'processing_log', 'homologated_results']
+
+        for i, (stmt, table_name) in enumerate(zip(SCHEMA_STATEMENTS, table_names), 1):
+            try:
+                await conn.execute(stmt)
+                print(f"   ✅ {i}. {table_name}")
+            except Exception as e:
+                print(f"   ❌ {i}. {table_name}: {e}")
+
+        print("\n5️⃣  Verifying tables...")
+        tables = await conn.fetch("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            ORDER BY table_name
+        """)
+
+        print(f"   ✅ Found {len(tables)} tables:")
+        for table in tables:
+            print(f"      - {table['table_name']}")
+
+        await conn.close()
+
+        print("\n" + "=" * 70)
+        print("✅ Schema Creation Complete!")
+        print("=" * 70)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+    finally:
+        await connector.close_async()
+
+if __name__ == "__main__":
+    asyncio.run(create_schema())
+
+
+    #!/usr/bin/env python3
+"""
+Initialize Database Schema
+Creates all tables needed for the PNCP Medical Data Processor
+"""
+
+import asyncio
+import os
+from dotenv import load_dotenv
+from google.cloud.sql.connector import Connector
+
+load_dotenv()
+
+async def initialize_database():
+    """Create database schema"""
+
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    region = os.getenv('CLOUD_SQL_REGION')
+    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
+    database_name = os.getenv('DATABASE_NAME')
+
+    connection_name = f"{project_id}:{region}:{instance_name}"
+
+    print("=" * 70)
+    print("Initializing Database Schema")
+    print("=" * 70)
+    print(f"\nConnection: {connection_name}")
+    print(f"Database: {database_name}")
+
+    connector = Connector()
+
+    try:
+        print("\n1️⃣  Connecting to Cloud SQL...")
+        conn = await connector.connect_async(
+            instance_connection_string=connection_name,
+            driver="asyncpg",
+            user=os.getenv('DB_USER'),
+            db=database_name,
+            enable_iam_auth=True,
+            ip_type="public"
+        )
+        print("   ✅ Connected successfully")
+
+        print("\n2️⃣  Reading schema.sql file...")
+        with open('schema.sql', 'r') as f:
+            schema_sql = f.read()
+        print("   ✅ Schema file loaded")
+
+        print("\n3️⃣  Creating database tables...")
+
+        # Split schema into individual statements and execute one by one
+        statements = [stmt.strip() for stmt in schema_sql.split(';') if stmt.strip()]
+
+        for i, stmt in enumerate(statements, 1):
+            if stmt:
+                try:
+                    await conn.execute(stmt)
+                    # Print progress for CREATE TABLE statements
+                    if 'CREATE TABLE' in stmt.upper():
+                        table_name = stmt.split('CREATE TABLE')[1].split('IF NOT EXISTS')[1].split('(')[0].strip() if 'IF NOT EXISTS' in stmt.upper() else stmt.split('CREATE TABLE')[1].split('(')[0].strip()
+                        print(f"      ✅ Created table: {table_name}")
+                except Exception as e:
+                    print(f"      ⚠️  Statement {i} warning: {e}")
+
+        print("   ✅ Schema execution completed")
+
+        print("\n4️⃣  Verifying tables...")
+        tables = await conn.fetch("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            ORDER BY table_name
+        """)
+
+        print(f"   ✅ Found {len(tables)} tables:")
+        for table in tables:
+            print(f"      - {table['table_name']}")
+
+        await conn.close()
+
+        print("\n" + "=" * 70)
+        print("✅ Database Initialization Complete!")
+        print("=" * 70)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        raise
+
+    finally:
+        await connector.close_async()
+
+if __name__ == "__main__":
+    asyncio.run(initialize_database())
+
+
+    #!/usr/bin/env python3
+"""
+Setup database permissions for IAM service account
+This script connects to Cloud SQL and grants necessary permissions
+"""
+
+import asyncio
+import asyncpg
+import os
+from dotenv import load_dotenv
+from google.cloud.sql.connector import Connector
+
+load_dotenv()
+
+async def setup_permissions():
+    """Grant database permissions to IAM service account"""
+
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    region = os.getenv('CLOUD_SQL_REGION')
+    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
+    database_name = os.getenv('DATABASE_NAME')
+    iam_user = "pncp-medical-app@medical-473219.iam"
+
+    connection_name = f"{project_id}:{region}:{instance_name}"
+
+    print("=" * 70)
+    print("Setting up Database Permissions for IAM User")
+    print("=" * 70)
+    print(f"\nConnection: {connection_name}")
+    print(f"Database: {database_name}")
+    print(f"IAM User: {iam_user}")
+
+    connector = Connector()
+
+    try:
+        print("\n1️⃣  Connecting to Cloud SQL using IAM authentication...")
+
+        # Connect with IAM auth using your service account
+        conn = await connector.connect_async(
+            instance_connection_string=connection_name,
+            driver="asyncpg",
+            user=os.getenv('DB_USER'),  # Your IAM service account
+            db=database_name,  # asyncpg uses 'db' not 'database'
+            enable_iam_auth=True,
+            ip_type="public"
+        )
+
+        print("   ✅ Connected successfully")
+
+        print(f"\n2️⃣  Granting permissions to {iam_user}...")
+
+        # Grant database connection
+        await conn.execute(f'GRANT CONNECT ON DATABASE {database_name} TO "{iam_user}"')
+        print("   ✅ Granted CONNECT")
+
+        # Grant schema usage and create
+        await conn.execute(f'GRANT USAGE, CREATE ON SCHEMA public TO "{iam_user}"')
+        print("   ✅ Granted USAGE and CREATE on schema")
+
+        # Grant permissions on all existing tables
+        await conn.execute(f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{iam_user}"')
+        print("   ✅ Granted table permissions")
+
+        # Grant permissions on all existing sequences
+        await conn.execute(f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO "{iam_user}"')
+        print("   ✅ Granted sequence permissions")
+
+        # Grant permissions on future tables
+        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{iam_user}"')
+        print("   ✅ Granted default table privileges")
+
+        # Grant permissions on future sequences
+        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO "{iam_user}"')
+        print("   ✅ Granted default sequence privileges")
+
+        print("\n3️⃣  Verifying permissions...")
+        # Check if user has permissions
+        result = await conn.fetch("""
+            SELECT grantee, privilege_type, table_schema, table_name
+            FROM information_schema.role_table_grants
+            WHERE grantee = $1
+            LIMIT 5
+        """, iam_user)
+
+        if result:
+            print(f"   ✅ User has {len(result)} granted permissions (showing first 5):")
+            for row in result[:5]:
+                print(f"      - {row['privilege_type']} on {row['table_schema']}.{row['table_name']}")
+        else:
+            print("   ⚠️  No permissions found in grants table (may need manual verification)")
+
+        await conn.close()
+
+        print("\n" + "=" * 70)
+        print("✅ Database Permissions Setup Complete!")
+        print("=" * 70)
+        print(f"\nThe IAM user '{iam_user}' now has:")
+        print("  • CONNECT privileges on database")
+        print("  • USAGE privileges on public schema")
+        print("  • SELECT, INSERT, UPDATE, DELETE on all tables")
+        print("  • USAGE, SELECT on all sequences")
+        print("  • Default privileges for future objects")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        print("\n💡 Troubleshooting:")
+        print("  1. Ensure you're authenticated: gcloud auth application-default login")
+        print("  2. Check your DB_USER in .env matches your service account")
+        print("  3. Verify the service account has cloudsql.client role")
+        raise
+
+    finally:
+        await connector.close_async()
+
+if __name__ == "__main__":
+    asyncio.run(setup_permissions())
+
+    #!/bin/bash
+# Setup IAM Authentication for Cloud SQL
+# This script configures the service account with proper permissions
+
+set -e
+
+echo "=================================="
+echo "Cloud SQL IAM Authentication Setup"
+echo "=================================="
+
+# Load environment variables
+if [ -f .env ]; then
+    export $(cat .env | grep -v '^#' | xargs)
+else
+    echo "❌ .env file not found"
+    exit 1
+fi
+
+# Verify required variables
+if [ -z "$GOOGLE_CLOUD_PROJECT" ] || [ -z "$CLOUD_SQL_INSTANCE" ] || [ -z "$CLOUD_SQL_REGION" ]; then
+    echo "❌ Missing required environment variables"
+    echo "Required: GOOGLE_CLOUD_PROJECT, CLOUD_SQL_INSTANCE, CLOUD_SQL_REGION"
+    exit 1
+fi
+
+echo ""
+echo "📋 Configuration:"
+echo "   Project: $GOOGLE_CLOUD_PROJECT"
+echo "   Region: $CLOUD_SQL_REGION"
+echo "   Instance: $CLOUD_SQL_INSTANCE"
+echo ""
+
+# Set project
+echo "1️⃣  Setting GCloud project..."
+gcloud config set project $GOOGLE_CLOUD_PROJECT
+
+# Get default service account
+DEFAULT_SA="${GOOGLE_CLOUD_PROJECT}@appspot.gserviceaccount.com"
+COMPUTE_SA="$(gcloud iam service-accounts list --filter="email ~ compute@developer" --format="value(email)" | head -1)"
+
+if [ -z "$COMPUTE_SA" ]; then
+    echo "⚠️  Compute Engine default service account not found"
+    echo "   Using App Engine default: $DEFAULT_SA"
+    SERVICE_ACCOUNT=$DEFAULT_SA
+else
+    echo "✅ Found Compute Engine service account: $COMPUTE_SA"
+    SERVICE_ACCOUNT=$COMPUTE_SA
+fi
+
+echo ""
+echo "2️⃣  Granting Cloud SQL Client role to service account..."
+gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
+    --member="serviceAccount:${SERVICE_ACCOUNT}" \
+    --role="roles/cloudsql.client" \
+    --condition=None
+
+echo ""
+echo "3️⃣  Granting Cloud SQL Instance User role..."
+gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
+    --member="serviceAccount:${SERVICE_ACCOUNT}" \
+    --role="roles/cloudsql.instanceUser" \
+    --condition=None
+
+echo ""
+echo "4️⃣  Checking Cloud SQL instance status..."
+INSTANCE_STATUS=$(gcloud sql instances describe $CLOUD_SQL_INSTANCE \
+    --project=$GOOGLE_CLOUD_PROJECT \
+    --format="value(state)" 2>/dev/null || echo "NOT_FOUND")
+
+if [ "$INSTANCE_STATUS" = "NOT_FOUND" ]; then
+    echo "❌ Cloud SQL instance '$CLOUD_SQL_INSTANCE' not found"
+    echo ""
+    echo "💡 To create the instance, run:"
+    echo "   gcloud sql instances create $CLOUD_SQL_INSTANCE \\"
+    echo "     --database-version=POSTGRES_15 \\"
+    echo "     --tier=db-f1-micro \\"
+    echo "     --region=$CLOUD_SQL_REGION \\"
+    echo "     --network=default \\"
+    echo "     --database-flags=cloudsql.iam_authentication=on"
+    exit 1
+elif [ "$INSTANCE_STATUS" != "RUNNABLE" ]; then
+    echo "⚠️  Instance is in state: $INSTANCE_STATUS (waiting for RUNNABLE)"
+    echo "   This may take a few minutes..."
+else
+    echo "✅ Instance is RUNNABLE"
+fi
+
+echo ""
+echo "5️⃣  Enabling IAM authentication on the instance..."
+gcloud sql instances patch $CLOUD_SQL_INSTANCE \
+    --project=$GOOGLE_CLOUD_PROJECT \
+    --database-flags=cloudsql.iam_authentication=on \
+    --quiet || echo "⚠️  IAM authentication may already be enabled"
+
+echo ""
+echo "6️⃣  Creating IAM database user..."
+# Extract username from service account email (part before @)
+DB_IAM_USER=$(echo $SERVICE_ACCOUNT | cut -d'@' -f1 | tr '.' '_' | tr '-' '_')
+
+echo "   Creating user: $DB_IAM_USER"
+echo "   (mapped from: $SERVICE_ACCOUNT)"
+
+# Try to create the IAM user
+gcloud sql users create $DB_IAM_USER \
+    --instance=$CLOUD_SQL_INSTANCE \
+    --project=$GOOGLE_CLOUD_PROJECT \
+    --type=CLOUD_IAM_SERVICE_ACCOUNT 2>/dev/null || echo "   (User may already exist)"
+
+echo ""
+echo "7️⃣  Setting up database permissions..."
+echo "   You'll need to run these SQL commands to grant permissions:"
+echo ""
+echo "   -- Connect to your database:"
+echo "   gcloud sql connect $CLOUD_SQL_INSTANCE --user=postgres --database=pncp_medical_data"
+echo ""
+echo "   -- Then run these SQL commands:"
+echo "   GRANT CONNECT ON DATABASE pncp_medical_data TO \"$DB_IAM_USER\";"
+echo "   GRANT USAGE ON SCHEMA public TO \"$DB_IAM_USER\";"
+echo "   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"$DB_IAM_USER\";"
+echo "   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO \"$DB_IAM_USER\";"
+echo "   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"$DB_IAM_USER\";"
+echo "   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO \"$DB_IAM_USER\";"
+echo ""
+
+echo "=================================="
+echo "✅ IAM Authentication Setup Complete"
+echo "=================================="
+echo ""
+echo "📝 Update your .env file with:"
+echo "   DB_USER=$SERVICE_ACCOUNT"
+echo "   # Remove DB_PASSWORD (not needed with IAM auth)"
+echo ""
+echo "🔑 The service account will authenticate using your gcloud credentials"
+echo ""
+echo "⚠️  Don't forget to run the SQL grant commands above!"
+
+
+#!/usr/bin/env python3
+"""
+Setup schema using owner account and grant permissions to service account
+"""
+
+import asyncio
+import os
+from dotenv import load_dotenv
+from google.cloud.sql.connector import Connector
+
+load_dotenv()
+
+# Table creation statements
+TABLES = {
+    'organizations': """
+        CREATE TABLE IF NOT EXISTS organizations (
+            id SERIAL PRIMARY KEY,
+            cnpj VARCHAR(18) UNIQUE NOT NULL,
+            name VARCHAR(500) NOT NULL,
+            government_level VARCHAR(50) NOT NULL,
+            organization_type VARCHAR(50),
+            state_code VARCHAR(2),
+            municipality_name VARCHAR(200),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    'tenders': """
+        CREATE TABLE IF NOT EXISTS tenders (
+            id SERIAL PRIMARY KEY,
+            organization_id INTEGER REFERENCES organizations(id),
+            cnpj VARCHAR(18) NOT NULL,
+            ano INTEGER NOT NULL,
+            sequencial INTEGER NOT NULL,
+            control_number VARCHAR(50) UNIQUE,
+            title VARCHAR(1000),
+            description TEXT,
+            government_level VARCHAR(50) NOT NULL,
+            tender_size VARCHAR(20) NOT NULL,
+            contracting_modality INTEGER,
+            modality_name VARCHAR(100),
+            total_estimated_value DECIMAL(15,2),
+            total_homologated_value DECIMAL(15,2),
+            publication_date DATE,
+            state_code VARCHAR(2),
+            municipality_code VARCHAR(10),
+            status VARCHAR(50) DEFAULT 'discovered',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    'tender_items': """
+        CREATE TABLE IF NOT EXISTS tender_items (
+            id SERIAL PRIMARY KEY,
+            tender_id INTEGER REFERENCES tenders(id),
+            item_number INTEGER,
+            description TEXT,
+            quantity DECIMAL(15,3),
+            unit VARCHAR(50),
+            unit_price DECIMAL(15,2),
+            total_price DECIMAL(15,2),
+            matched_product_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    'matched_products': """
+        CREATE TABLE IF NOT EXISTS matched_products (
+            id SERIAL PRIMARY KEY,
+            tender_item_id INTEGER REFERENCES tender_items(id),
+            product_code VARCHAR(100),
+            product_name VARCHAR(500),
+            match_score DECIMAL(5,2),
+            fob_price_usd DECIMAL(15,2),
+            fob_price_brl DECIMAL(15,2),
+            price_difference_pct DECIMAL(5,2),
+            is_competitive BOOLEAN,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    'processing_log': """
+        CREATE TABLE IF NOT EXISTS processing_log (
+            id SERIAL PRIMARY KEY,
+            process_type VARCHAR(100),
+            state_code VARCHAR(2),
+            status VARCHAR(50),
+            records_processed INTEGER DEFAULT 0,
+            records_matched INTEGER DEFAULT 0,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            error_message TEXT,
+            metadata JSONB
+        )
+    """,
+    'homologated_results': """
+        CREATE TABLE IF NOT EXISTS homologated_results (
+            id SERIAL PRIMARY KEY,
+            tender_id INTEGER REFERENCES tenders(id),
+            item_number INTEGER,
+            supplier_cnpj VARCHAR(18),
+            supplier_name VARCHAR(500),
+            homologated_unit_price DECIMAL(15,2),
+            homologated_quantity DECIMAL(15,3),
+            homologated_total_price DECIMAL(15,2),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """
+}
+
+async def setup_schema():
+    """Create schema using owner account"""
+
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    region = os.getenv('CLOUD_SQL_REGION')
+    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
+    database_name = os.getenv('DATABASE_NAME')
+    service_account_user = "pncp-medical-app@medical-473219.iam"
+
+    connection_name = f"{project_id}:{region}:{instance_name}"
+
+    print("=" * 70)
+    print("Setup Database Schema (as Owner)")
+    print("=" * 70)
+    print(f"\nConnection: {connection_name}")
+    print(f"Database: {database_name}")
+    print(f"User: gabrielreginatto@gmail.com (owner)")
+
+    connector = Connector()
+
+    try:
+        print("\n1️⃣  Connecting to Cloud SQL as owner...")
+        conn = await connector.connect_async(
+            instance_connection_string=connection_name,
+            driver="asyncpg",
+            user="gabrielreginatto@gmail.com",
+            db=database_name,
+            enable_iam_auth=True,
+            ip_type="public"
+        )
+        print("   ✅ Connected successfully")
+
+        print("\n2️⃣  Creating tables...")
+        for table_name, create_stmt in TABLES.items():
+            try:
+                await conn.execute(create_stmt)
+                print(f"   ✅ {table_name}")
+            except Exception as e:
+                print(f"   ⚠️  {table_name}: {e}")
+
+        print("\n3️⃣  Granting permissions to service account...")
+        print(f"   Service Account: {service_account_user}")
+
+        # Grant all permissions on all tables
+        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "{service_account_user}"')
+        print("   ✅ Granted ALL on tables")
+
+        # Grant all permissions on all sequences
+        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "{service_account_user}"')
+        print("   ✅ Granted ALL on sequences")
+
+        # Grant default privileges for future objects
+        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO "{service_account_user}"')
+        print("   ✅ Granted default privileges on tables")
+
+        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO "{service_account_user}"')
+        print("   ✅ Granted default privileges on sequences")
+
+        print("\n4️⃣  Verifying tables...")
+        tables = await conn.fetch("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            ORDER BY table_name
+        """)
+
+        print(f"   ✅ Found {len(tables)} tables:")
+        for table in tables:
+            print(f"      - {table['table_name']}")
+
+        await conn.close()
+
+        print("\n" + "=" * 70)
+        print("✅ Schema Setup Complete!")
+        print("=" * 70)
+        print(f"\nService account '{service_account_user}' now has:")
+        print("  • ALL privileges on all tables")
+        print("  • ALL privileges on all sequences")
+        print("  • Default privileges for future objects")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+    finally:
+        await connector.close_async()
+
+if __name__ == "__main__":
+    asyncio.run(setup_schema())
+
+
+    #!/usr/bin/env python3
+"""
+Setup schema using postgres user and grant permissions to service account
+"""
+
+import asyncio
+from dotenv import load_dotenv
+from google.cloud.sql.connector import Connector
+import os
+
+load_dotenv()
+
+# Table definitions (abbreviated for speed)
+SCHEMA_SQL = open('schema.sql', 'r').read()
+
+async def setup():
+    """Create schema using postgres user"""
+
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    region = os.getenv('CLOUD_SQL_REGION')
+    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
+    database_name = os.getenv('DATABASE_NAME')
+    service_account_user = "pncp-medical-app@medical-473219.iam"
+
+    connection_name = f"{project_id}:{region}:{instance_name}"
+
+    print("=" * 70)
+    print("Setup Database Schema")
+    print("=" * 70)
+
+    connector = Connector()
+
+    try:
+        print("\n1️⃣  Connecting as postgres...")
+        conn = await connector.connect_async(
+            instance_connection_string=connection_name,
+            driver="asyncpg",
+            user="postgres",
+            password="TempPass123!",
+            db=database_name,
+            ip_type="public"
+        )
+        print("   ✅ Connected")
+
+        print("\n2️⃣  Creating tables...")
+        statements = [s.strip() for s in SCHEMA_SQL.split(';') if s.strip() and 'CREATE TABLE' in s.upper()]
+
+        for stmt in statements:
+            try:
+                await conn.execute(stmt)
+                # Extract table name
+                if 'IF NOT EXISTS' in stmt.upper():
+                    table_name = stmt.split('IF NOT EXISTS')[1].split('(')[0].strip()
+                else:
+                    table_name = stmt.split('CREATE TABLE')[1].split('(')[0].strip()
+                print(f"   ✅ {table_name}")
+            except Exception as e:
+                print(f"   ⚠️  Error: {e}")
+
+        print("\n3️⃣  Granting permissions to service account...")
+        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "{service_account_user}"')
+        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "{service_account_user}"')
+        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "{service_account_user}"')
+        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "{service_account_user}"')
+        print(f"   ✅ Granted all privileges to {service_account_user}")
+
+        print("\n4️⃣  Verifying...")
+        tables = await conn.fetch("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name")
+        print(f"   ✅ {len(tables)} tables created:")
+        for t in tables:
+            print(f"      - {t['table_name']}")
+
+        await conn.close()
+
+        print("\n" + "=" * 70)
+        print("✅ Setup Complete!")
+        print("=" * 70)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        raise
+    finally:
+        await connector.close_async()
+
+if __name__ == "__main__":
+    asyncio.run(setup())
