@@ -1,12 +1,11 @@
 """
-Configuration module for PNCP API Integration
+Shared configuration module for PNCP API Integration
 Contains Brazilian states, tender classifications, and system configurations
+Used by both medical and lacre modules
 """
 
-import os
 from enum import Enum
-from typing import Dict, List, Optional
-from dataclasses import dataclass
+from typing import Dict, List
 
 # Brazilian States and Federal District
 BRAZILIAN_STATES = {
@@ -80,98 +79,12 @@ CONTRACTING_MODALITIES = {
     13: "Leilão - Presencial"
 }
 
-# Process categories that are relevant to medical supplies
-RELEVANT_PROCESS_CATEGORIES = {
-    2: "Compras",
-    8: "Serviços",
-    10: "Serviços de Saúde"
-}
-
-@dataclass
+# Tender size thresholds (in BRL)
 class TenderSizeThresholds:
-    """Value thresholds for tender size classification (in BRL)"""
+    """Value thresholds for tender size classification"""
     small_max: float = 50_000.0
     medium_max: float = 500_000.0
     large_max: float = 5_000_000.0
-
-@dataclass
-class ProcessingConfig:
-    """Configuration for processing parameters"""
-    # States to process (empty list means all states)
-    enabled_states: List[str] = None
-
-    # Government levels to include
-    government_levels: List[GovernmentLevel] = None
-
-    # Minimum tender value to process (BRL)
-    min_tender_value: float = 1_000.0
-
-    # Maximum tender value to process (BRL)
-    max_tender_value: Optional[float] = None
-
-    # Date range for processing
-    start_date: Optional[str] = None  # YYYYMMDD format
-    end_date: Optional[str] = None    # YYYYMMDD format
-
-    # Contracting modalities to include
-    allowed_modalities: List[int] = None
-
-    # Organization types to include
-    allowed_org_types: List[OrganizationType] = None
-
-    # Product matching minimum score
-    min_match_score: float = 50.0
-
-    # API rate limiting
-    max_requests_per_minute: int = 60
-    max_requests_per_hour: int = 1000
-
-    def __post_init__(self):
-        """Set defaults for None values"""
-        if self.enabled_states is None:
-            self.enabled_states = list(BRAZILIAN_STATES.keys())
-
-        if self.government_levels is None:
-            self.government_levels = [GovernmentLevel.FEDERAL, GovernmentLevel.STATE, GovernmentLevel.MUNICIPAL]
-
-        if self.allowed_modalities is None:
-            # Focus on electronic bidding modalities most likely to have medical supplies
-            self.allowed_modalities = [4, 6, 8]  # Concorrência Eletrônica, Pregão Eletrônico, Dispensa
-
-        if self.allowed_org_types is None:
-            self.allowed_org_types = [
-                OrganizationType.HOSPITAL,
-                OrganizationType.HEALTH_SECRETARIAT,
-                OrganizationType.GOVERNMENT_AGENCY
-            ]
-
-# Import DatabaseConfig from shared location (for backwards compatibility)
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from database_config import DatabaseConfig
-
-class APIConfig:
-    """PNCP API configuration"""
-
-    # Base URLs
-    BASE_URL = "https://pncp.gov.br/api"
-    CONSULTATION_BASE_URL = "https://pncp.gov.br/api/consulta"
-
-    # Endpoints
-    LOGIN_ENDPOINT = "/v1/usuarios/login"
-    TENDERS_ENDPOINT = "/v1/contratacoes/publicacao"
-    TENDER_ITEMS_ENDPOINT = "/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens"
-    ITEM_RESULTS_ENDPOINT = "/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens/{numeroItem}/resultados"
-
-    # Request settings
-    REQUEST_TIMEOUT = 30
-    MAX_RETRIES = 3
-    RETRY_DELAY = 1  # seconds
-
-    # Response pagination
-    MIN_PAGE_SIZE = 10  # API minimum requirement
-    DEFAULT_PAGE_SIZE = 10  # Use conservative page size
-    MAX_PAGE_SIZE = 50  # PNCP API maximum supported
 
 # Utility functions
 def get_state_name(state_code: str) -> str:
@@ -237,15 +150,11 @@ def classify_government_level(cnpj: str, org_name: str = "") -> GovernmentLevel:
             return GovernmentLevel.MUNICIPAL
 
     # Default classification based on CNPJ patterns (simplified)
-    # This would need more sophisticated logic in practice
     return GovernmentLevel.UNKNOWN
 
 def get_modality_name(code: int) -> str:
     """Get contracting modality name from code"""
     return CONTRACTING_MODALITIES.get(code, f"Unknown ({code})")
-
-# Default configuration instance
-DEFAULT_CONFIG = ProcessingConfig()
 
 # Export key components
 __all__ = [
@@ -254,10 +163,7 @@ __all__ = [
     'TenderSize',
     'OrganizationType',
     'CONTRACTING_MODALITIES',
-    'ProcessingConfig',
-    'DatabaseConfig',
-    'APIConfig',
-    'DEFAULT_CONFIG',
+    'TenderSizeThresholds',
     'get_state_name',
     'get_state_codes',
     'classify_tender_size',

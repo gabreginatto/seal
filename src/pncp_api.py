@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 import time
 import os
-from config import APIConfig, ProcessingConfig
+from api_config import APIConfig, RateLimitConfig
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +95,10 @@ class PNCPAPIClient:
         self.consultation_url = APIConfig.CONSULTATION_BASE_URL
         self.session: Optional[aiohttp.ClientSession] = None
         self.auth_token: Optional[AuthToken] = None
+        rate_config = RateLimitConfig()
         self.rate_limiter = rate_limiter or RateLimiter(
-            ProcessingConfig().max_requests_per_minute,
-            ProcessingConfig().max_requests_per_hour
+            rate_config.max_requests_per_minute,
+            rate_config.max_requests_per_hour
         )
 
     async def __aenter__(self):

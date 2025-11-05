@@ -7,16 +7,15 @@ from enum import Enum
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
-# Import shared configurations from base config (medical config has base definitions)
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'medical'))
+# Import shared configurations from base config
 from config import (
     BRAZILIAN_STATES, GovernmentLevel, TenderSize, OrganizationType,
-    CONTRACTING_MODALITIES, TenderSizeThresholds, DatabaseConfig, APIConfig,
+    CONTRACTING_MODALITIES, TenderSizeThresholds,
     get_state_name, get_state_codes, classify_tender_size,
     classify_government_level, get_modality_name
 )
+from database_config import DatabaseConfig
+from api_config import APIConfig
 
 # Lacre product categories
 class LacreType(Enum):

@@ -7,6 +7,12 @@ This is a wrapper that delegates to the lacre-specific implementation in src/lac
 """
 
 if __name__ == "__main__":
+    import sys
+    import os
     import asyncio
+
+    # Add src directory to Python path for imports
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
     from src.lacre.main_lacre import main
     asyncio.run(main())

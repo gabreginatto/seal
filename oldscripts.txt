@@ -1,857 +1,452 @@
 #!/usr/bin/env python3
 """
-Simple schema creation - creates tables if they don't exist
-Uses CREATE TABLE IF NOT EXISTS to avoid conflicts
+PNCP Medical Data Processing - Main Orchestration Script
+Coordinates the complete workflow from tender discovery to product matching
 """
 
 import asyncio
+import logging
+import argparse
 import os
+from datetime import datetime
+from typing import List, Optional
 from dotenv import load_dotenv
-from google.cloud.sql.connector import Connector
 
 load_dotenv()
 
-# Simple schema statements
-SCHEMA_STATEMENTS = [
-    """
-    CREATE TABLE IF NOT EXISTS organizations (
-        id SERIAL PRIMARY KEY,
-        cnpj VARCHAR(18) UNIQUE NOT NULL,
-        name VARCHAR(500) NOT NULL,
-        government_level VARCHAR(50) NOT NULL,
-        organization_type VARCHAR(50),
-        state_code VARCHAR(2),
-        municipality_name VARCHAR(200),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+from config import ProcessingConfig, BRAZILIAN_STATES
+from database import CloudSQLManager, DatabaseOperations, create_db_manager_from_env
+from pncp_api import PNCPAPIClient
+from classifier import TenderClassifier
+from optimized_discovery import OptimizedTenderDiscovery, DiscoveryMetrics
+from fetch_and_save_items import fetch_and_save_items
+from match_tender_items import match_tender_items
+
+# Configure logging (will be set up properly in main())
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(run_mode: str = "full"):
+    """Setup logging with timestamped file"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = f'logs/pncp_run_{run_mode}_{timestamp}.log'
+
+    # Create logs directory if it doesn't exist
+    os.makedirs('logs', exist_ok=True)
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()
+        ],
+        force=True  # Override any existing config
     )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS tenders (
-        id SERIAL PRIMARY KEY,
-        organization_id INTEGER REFERENCES organizations(id),
-        cnpj VARCHAR(18) NOT NULL,
-        ano INTEGER NOT NULL,
-        sequencial INTEGER NOT NULL,
-        control_number VARCHAR(50) UNIQUE,
-        title VARCHAR(1000),
-        description TEXT,
-        government_level VARCHAR(50) NOT NULL,
-        tender_size VARCHAR(20) NOT NULL,
-        contracting_modality INTEGER,
-        modality_name VARCHAR(100),
-        total_estimated_value DECIMAL(15,2),
-        total_homologated_value DECIMAL(15,2),
-        publication_date DATE,
-        state_code VARCHAR(2),
-        municipality_code VARCHAR(10),
-        status VARCHAR(50) DEFAULT 'discovered',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS tender_items (
-        id SERIAL PRIMARY KEY,
-        tender_id INTEGER REFERENCES tenders(id),
-        item_number INTEGER,
-        description TEXT,
-        quantity DECIMAL(15,3),
-        unit VARCHAR(50),
-        unit_price DECIMAL(15,2),
-        total_price DECIMAL(15,2),
-        matched_product_id INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS matched_products (
-        id SERIAL PRIMARY KEY,
-        tender_item_id INTEGER REFERENCES tender_items(id),
-        product_code VARCHAR(100),
-        product_name VARCHAR(500),
-        match_score DECIMAL(5,2),
-        fob_price_usd DECIMAL(15,2),
-        fob_price_brl DECIMAL(15,2),
-        price_difference_pct DECIMAL(5,2),
-        is_competitive BOOLEAN,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS processing_log (
-        id SERIAL PRIMARY KEY,
-        process_type VARCHAR(100),
-        state_code VARCHAR(2),
-        status VARCHAR(50),
-        records_processed INTEGER DEFAULT 0,
-        records_matched INTEGER DEFAULT 0,
-        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        completed_at TIMESTAMP,
-        error_message TEXT,
-        metadata JSONB
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS homologated_results (
-        id SERIAL PRIMARY KEY,
-        tender_id INTEGER REFERENCES tenders(id),
-        item_number INTEGER,
-        supplier_cnpj VARCHAR(18),
-        supplier_name VARCHAR(500),
-        homologated_unit_price DECIMAL(15,2),
-        homologated_quantity DECIMAL(15,3),
-        homologated_total_price DECIMAL(15,2),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """
-]
 
-async def create_schema():
-    """Create database schema"""
+    logger.info("=" * 70)
+    logger.info(f"📝 Log file: {log_filename}")
+    logger.info("=" * 70)
 
-    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
-    region = os.getenv('CLOUD_SQL_REGION')
-    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
-    database_name = os.getenv('DATABASE_NAME')
+    return log_filename
 
-    connection_name = f"{project_id}:{region}:{instance_name}"
 
-    print("=" * 70)
-    print("Creating Database Schema")
-    print("=" * 70)
-    print(f"\nConnection: {connection_name}")
-    print(f"Database: {database_name}")
+class PNCPMedicalProcessor:
+    """Main orchestration class for PNCP medical data processing"""
 
-    connector = Connector()
+    def __init__(self, config: ProcessingConfig = None):
+        self.config = config or ProcessingConfig()
+        self.db_manager: Optional[CloudSQLManager] = None
+        self.db_ops: Optional[DatabaseOperations] = None
+        self.api_client: Optional[PNCPAPIClient] = None
+        self.classifier: Optional[TenderClassifier] = None
+        self.discovery_engine: Optional[OptimizedTenderDiscovery] = None
 
-    try:
-        print("\n1️⃣  Connecting to Cloud SQL...")
-        conn = await connector.connect_async(
-            instance_connection_string=connection_name,
-            driver="asyncpg",
-            user=os.getenv('DB_USER'),
-            db="postgres",  # Connect to postgres database first
-            enable_iam_auth=True,
-            ip_type="public"
-        )
-        print("   ✅ Connected to postgres database")
+    async def initialize(self):
+        """Initialize all components"""
+        logger.info("Initializing PNCP Medical Processor...")
 
-        # Check if our database exists
-        print(f"\n2️⃣  Checking if database '{database_name}' exists...")
-        exists = await conn.fetchval(
-            "SELECT 1 FROM pg_database WHERE datname = $1",
-            database_name
-        )
+        try:
+            # Initialize database
+            self.db_manager = create_db_manager_from_env()
+            self.db_ops = DatabaseOperations(self.db_manager)
+            logger.info("✅ Database initialized")
 
-        if not exists:
-            print(f"   Creating database '{database_name}'...")
-            # Need to close current connection to create database
-            await conn.close()
+            # Initialize API client
+            self.api_client = PNCPAPIClient()
+            await self.api_client.start_session()
+            logger.info("✅ API client initialized")
 
-            # Reconnect and create
-            conn = await connector.connect_async(
-                instance_connection_string=connection_name,
-                driver="asyncpg",
-                user=os.getenv('DB_USER'),
-                db="postgres",
-                enable_iam_auth=True,
-                ip_type="public"
+            # Initialize classifier
+            self.classifier = TenderClassifier()
+            logger.info("✅ Classifier initialized")
+
+            # Initialize discovery engine
+            self.discovery_engine = OptimizedTenderDiscovery(
+                self.api_client,
+                self.classifier,
+                self.db_ops,
+                self.config
             )
+            logger.info("✅ Discovery engine initialized")
 
-            await conn.execute(f'CREATE DATABASE {database_name}')
-            print(f"   ✅ Database created")
+            logger.info("Initialization completed successfully\n")
+
+        except Exception as e:
+            logger.error(f"Initialization failed: {e}")
+            raise
+
+    async def discover_tenders(self, start_date: str, end_date: str, states: List[str] = None):
+        """Phase 1: Discover tenders"""
+        if not self.discovery_engine:
+            raise RuntimeError("Discovery engine not initialized")
+
+        states = states or self.config.enabled_states
+        logger.info(f"🔍 Phase 1: Tender Discovery")
+        logger.info(f"   Date Range: {start_date} to {end_date}")
+        logger.info(f"   States: {', '.join(states)}")
+
+        # Process each state individually
+        total_tenders = 0
+        all_metrics = []
+
+        for state in states:
+            logger.info(f"\n   Processing state: {state}")
+            tenders, metrics = await self.discovery_engine.discover_medical_tenders_optimized(
+                state=state,
+                start_date=start_date,
+                end_date=end_date
+            )
+            total_tenders += metrics.stage4_full_processing.tenders_out
+            all_metrics.append(metrics)
+
+        logger.info(f"\n✅ Discovery Complete: {total_tenders} medical tenders saved across {len(states)} state(s)")
+        return all_metrics[0] if all_metrics else None
+
+    async def fetch_items(self):
+        """Phase 2: Fetch items for discovered tenders"""
+        logger.info(f"\n📦 Phase 2: Fetching Tender Items")
+
+        # Close current API client session since fetch_and_save_items creates its own
+        if self.api_client:
+            await self.api_client.close_session()
+            self.api_client = None
+
+        # Call the standalone function
+        await fetch_and_save_items()
+
+        logger.info(f"✅ Item fetching complete")
+
+    async def match_products(self):
+        """Phase 3: Match tender items with Fernandes products"""
+        logger.info(f"\n🔍 Phase 3: Product Matching")
+
+        # Call the standalone function
+        await match_tender_items()
+
+        logger.info(f"✅ Product matching complete")
+
+    async def run_complete_workflow(self, start_date: str, end_date: str, states: List[str] = None, enable_matching: bool = False):
+        """Run complete workflow: discovery → items → (optional) matching
+
+        Args:
+            start_date: Start date in YYYYMMDD format
+            end_date: End date in YYYYMMDD format
+            states: List of state codes to process
+            enable_matching: If True, run Phase 3 (product matching). Default False.
+        """
+
+        logger.info("\n" + "=" * 70)
+        logger.info("🚀 PNCP MEDICAL DATA PROCESSING - COMPLETE WORKFLOW")
+        logger.info("=" * 70)
+        logger.info(f"📅 Date Range: {start_date} to {end_date}")
+        logger.info(f"🗺️  States: {', '.join(states) if states else 'ALL'}")
+        if enable_matching:
+            logger.info("🔍 Product Matching: ENABLED")
         else:
-            print(f"   ✅ Database exists")
+            logger.info("🔍 Product Matching: SKIPPED (use --match to enable)")
+        logger.info("=" * 70)
 
-        await conn.close()
+        workflow_start = datetime.now()
 
-        # Now connect to our database and create tables
-        print(f"\n3️⃣  Connecting to '{database_name}'...")
-        conn = await connector.connect_async(
-            instance_connection_string=connection_name,
-            driver="asyncpg",
-            user=os.getenv('DB_USER'),
-            db=database_name,
-            enable_iam_auth=True,
-            ip_type="public"
-        )
-        print("   ✅ Connected")
+        try:
+            # Initialize
+            await self.initialize()
 
-        print("\n4️⃣  Creating tables...")
-        table_names = ['organizations', 'tenders', 'tender_items', 'matched_products', 'processing_log', 'homologated_results']
+            # Phase 1: Discovery
+            logger.info("\n" + "=" * 70)
+            logger.info("PHASE 1: TENDER DISCOVERY")
+            logger.info("=" * 70)
+            phase1_start = datetime.now()
 
-        for i, (stmt, table_name) in enumerate(zip(SCHEMA_STATEMENTS, table_names), 1):
+            discovery_metrics = await self.discover_tenders(start_date, end_date, states)
+
+            phase1_time = (datetime.now() - phase1_start).total_seconds()
+            logger.info(f"⏱️  Phase 1 completed in {phase1_time:.1f}s")
+
+            if not discovery_metrics or discovery_metrics.stage4_full_processing.tenders_out == 0:
+                logger.warning("\n⚠️  No medical tenders found. Workflow stopped.")
+                return
+
+            # Phase 2: Fetch Items
+            logger.info("\n" + "=" * 70)
+            logger.info("PHASE 2: FETCHING TENDER ITEMS")
+            logger.info("=" * 70)
+            phase2_start = datetime.now()
+
+            await self.fetch_items()
+
+            phase2_time = (datetime.now() - phase2_start).total_seconds()
+            logger.info(f"⏱️  Phase 2 completed in {phase2_time:.1f}s")
+
+            # Phase 3: Match Products (Optional)
+            phase3_time = 0
+            if enable_matching:
+                logger.info("\n" + "=" * 70)
+                logger.info("PHASE 3: PRODUCT MATCHING")
+                logger.info("=" * 70)
+                phase3_start = datetime.now()
+
+                await self.match_products()
+
+                phase3_time = (datetime.now() - phase3_start).total_seconds()
+                logger.info(f"⏱️  Phase 3 completed in {phase3_time:.1f}s")
+            else:
+                logger.info("\n" + "=" * 70)
+                logger.info("PHASE 3: PRODUCT MATCHING - SKIPPED")
+                logger.info("=" * 70)
+                logger.info("💡 Tip: Use Looker Studio to explore items, then run ai_matching/ for targeted matches")
+
+            # Summary
+            total_time = (datetime.now() - workflow_start).total_seconds()
+            logger.info("\n" + "=" * 70)
+            logger.info("✅ WORKFLOW COMPLETE - SUMMARY")
+            logger.info("=" * 70)
+            logger.info(f"Phase 1 (Discovery): {phase1_time:.1f}s")
+            logger.info(f"Phase 2 (Items):     {phase2_time:.1f}s")
+            if enable_matching:
+                logger.info(f"Phase 3 (Matching):  {phase3_time:.1f}s")
+            else:
+                logger.info(f"Phase 3 (Matching):  SKIPPED")
+            logger.info(f"Total Time:          {total_time:.1f}s")
+            logger.info("=" * 70)
+
+        except Exception as e:
+            logger.error(f"\n❌ Workflow failed: {e}", exc_info=True)
+            raise
+
+    async def cleanup(self):
+        """Clean up resources"""
+        logger.info("\nCleaning up resources...")
+
+        if self.api_client:
+            await self.api_client.close_session()
+
+        if self.db_manager:
+            await self.db_manager.close()
+
+        logger.info("✅ Cleanup completed")
+
+
+def get_interactive_input():
+    """Get user input interactively"""
+
+    print("\n" + "=" * 70)
+    print("🚀 PNCP MEDICAL DATA PROCESSOR - Interactive Mode")
+    print("=" * 70)
+
+    # Get start date
+    while True:
+        start_date = input("\n📅 Enter START DATE (YYYYMMDD, e.g., 20240101): ").strip()
+        if len(start_date) == 8 and start_date.isdigit():
             try:
-                await conn.execute(stmt)
-                print(f"   ✅ {i}. {table_name}")
-            except Exception as e:
-                print(f"   ❌ {i}. {table_name}: {e}")
-
-        print("\n5️⃣  Verifying tables...")
-        tables = await conn.fetch("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-            ORDER BY table_name
-        """)
-
-        print(f"   ✅ Found {len(tables)} tables:")
-        for table in tables:
-            print(f"      - {table['table_name']}")
-
-        await conn.close()
-
-        print("\n" + "=" * 70)
-        print("✅ Schema Creation Complete!")
-        print("=" * 70)
-
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-    finally:
-        await connector.close_async()
-
-if __name__ == "__main__":
-    asyncio.run(create_schema())
-
-
-    #!/usr/bin/env python3
-"""
-Initialize Database Schema
-Creates all tables needed for the PNCP Medical Data Processor
-"""
-
-import asyncio
-import os
-from dotenv import load_dotenv
-from google.cloud.sql.connector import Connector
-
-load_dotenv()
-
-async def initialize_database():
-    """Create database schema"""
-
-    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
-    region = os.getenv('CLOUD_SQL_REGION')
-    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
-    database_name = os.getenv('DATABASE_NAME')
-
-    connection_name = f"{project_id}:{region}:{instance_name}"
-
-    print("=" * 70)
-    print("Initializing Database Schema")
-    print("=" * 70)
-    print(f"\nConnection: {connection_name}")
-    print(f"Database: {database_name}")
-
-    connector = Connector()
-
-    try:
-        print("\n1️⃣  Connecting to Cloud SQL...")
-        conn = await connector.connect_async(
-            instance_connection_string=connection_name,
-            driver="asyncpg",
-            user=os.getenv('DB_USER'),
-            db=database_name,
-            enable_iam_auth=True,
-            ip_type="public"
-        )
-        print("   ✅ Connected successfully")
-
-        print("\n2️⃣  Reading schema.sql file...")
-        with open('schema.sql', 'r') as f:
-            schema_sql = f.read()
-        print("   ✅ Schema file loaded")
-
-        print("\n3️⃣  Creating database tables...")
-
-        # Split schema into individual statements and execute one by one
-        statements = [stmt.strip() for stmt in schema_sql.split(';') if stmt.strip()]
-
-        for i, stmt in enumerate(statements, 1):
-            if stmt:
-                try:
-                    await conn.execute(stmt)
-                    # Print progress for CREATE TABLE statements
-                    if 'CREATE TABLE' in stmt.upper():
-                        table_name = stmt.split('CREATE TABLE')[1].split('IF NOT EXISTS')[1].split('(')[0].strip() if 'IF NOT EXISTS' in stmt.upper() else stmt.split('CREATE TABLE')[1].split('(')[0].strip()
-                        print(f"      ✅ Created table: {table_name}")
-                except Exception as e:
-                    print(f"      ⚠️  Statement {i} warning: {e}")
-
-        print("   ✅ Schema execution completed")
-
-        print("\n4️⃣  Verifying tables...")
-        tables = await conn.fetch("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-            ORDER BY table_name
-        """)
-
-        print(f"   ✅ Found {len(tables)} tables:")
-        for table in tables:
-            print(f"      - {table['table_name']}")
-
-        await conn.close()
-
-        print("\n" + "=" * 70)
-        print("✅ Database Initialization Complete!")
-        print("=" * 70)
-
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        raise
-
-    finally:
-        await connector.close_async()
-
-if __name__ == "__main__":
-    asyncio.run(initialize_database())
-
-
-    #!/usr/bin/env python3
-"""
-Setup database permissions for IAM service account
-This script connects to Cloud SQL and grants necessary permissions
-"""
-
-import asyncio
-import asyncpg
-import os
-from dotenv import load_dotenv
-from google.cloud.sql.connector import Connector
-
-load_dotenv()
-
-async def setup_permissions():
-    """Grant database permissions to IAM service account"""
-
-    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
-    region = os.getenv('CLOUD_SQL_REGION')
-    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
-    database_name = os.getenv('DATABASE_NAME')
-    iam_user = "pncp-medical-app@medical-473219.iam"
-
-    connection_name = f"{project_id}:{region}:{instance_name}"
-
-    print("=" * 70)
-    print("Setting up Database Permissions for IAM User")
-    print("=" * 70)
-    print(f"\nConnection: {connection_name}")
-    print(f"Database: {database_name}")
-    print(f"IAM User: {iam_user}")
-
-    connector = Connector()
-
-    try:
-        print("\n1️⃣  Connecting to Cloud SQL using IAM authentication...")
-
-        # Connect with IAM auth using your service account
-        conn = await connector.connect_async(
-            instance_connection_string=connection_name,
-            driver="asyncpg",
-            user=os.getenv('DB_USER'),  # Your IAM service account
-            db=database_name,  # asyncpg uses 'db' not 'database'
-            enable_iam_auth=True,
-            ip_type="public"
-        )
-
-        print("   ✅ Connected successfully")
-
-        print(f"\n2️⃣  Granting permissions to {iam_user}...")
-
-        # Grant database connection
-        await conn.execute(f'GRANT CONNECT ON DATABASE {database_name} TO "{iam_user}"')
-        print("   ✅ Granted CONNECT")
-
-        # Grant schema usage and create
-        await conn.execute(f'GRANT USAGE, CREATE ON SCHEMA public TO "{iam_user}"')
-        print("   ✅ Granted USAGE and CREATE on schema")
-
-        # Grant permissions on all existing tables
-        await conn.execute(f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{iam_user}"')
-        print("   ✅ Granted table permissions")
-
-        # Grant permissions on all existing sequences
-        await conn.execute(f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO "{iam_user}"')
-        print("   ✅ Granted sequence permissions")
-
-        # Grant permissions on future tables
-        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{iam_user}"')
-        print("   ✅ Granted default table privileges")
-
-        # Grant permissions on future sequences
-        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO "{iam_user}"')
-        print("   ✅ Granted default sequence privileges")
-
-        print("\n3️⃣  Verifying permissions...")
-        # Check if user has permissions
-        result = await conn.fetch("""
-            SELECT grantee, privilege_type, table_schema, table_name
-            FROM information_schema.role_table_grants
-            WHERE grantee = $1
-            LIMIT 5
-        """, iam_user)
-
-        if result:
-            print(f"   ✅ User has {len(result)} granted permissions (showing first 5):")
-            for row in result[:5]:
-                print(f"      - {row['privilege_type']} on {row['table_schema']}.{row['table_name']}")
+                datetime.strptime(start_date, '%Y%m%d')
+                break
+            except ValueError:
+                print("❌ Invalid date. Please use format YYYYMMDD")
         else:
-            print("   ⚠️  No permissions found in grants table (may need manual verification)")
+            print("❌ Invalid format. Please enter 8 digits (YYYYMMDD)")
 
-        await conn.close()
-
-        print("\n" + "=" * 70)
-        print("✅ Database Permissions Setup Complete!")
-        print("=" * 70)
-        print(f"\nThe IAM user '{iam_user}' now has:")
-        print("  • CONNECT privileges on database")
-        print("  • USAGE privileges on public schema")
-        print("  • SELECT, INSERT, UPDATE, DELETE on all tables")
-        print("  • USAGE, SELECT on all sequences")
-        print("  • Default privileges for future objects")
-
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        print("\n💡 Troubleshooting:")
-        print("  1. Ensure you're authenticated: gcloud auth application-default login")
-        print("  2. Check your DB_USER in .env matches your service account")
-        print("  3. Verify the service account has cloudsql.client role")
-        raise
-
-    finally:
-        await connector.close_async()
-
-if __name__ == "__main__":
-    asyncio.run(setup_permissions())
-
-    #!/bin/bash
-# Setup IAM Authentication for Cloud SQL
-# This script configures the service account with proper permissions
-
-set -e
-
-echo "=================================="
-echo "Cloud SQL IAM Authentication Setup"
-echo "=================================="
-
-# Load environment variables
-if [ -f .env ]; then
-    export $(cat .env | grep -v '^#' | xargs)
-else
-    echo "❌ .env file not found"
-    exit 1
-fi
-
-# Verify required variables
-if [ -z "$GOOGLE_CLOUD_PROJECT" ] || [ -z "$CLOUD_SQL_INSTANCE" ] || [ -z "$CLOUD_SQL_REGION" ]; then
-    echo "❌ Missing required environment variables"
-    echo "Required: GOOGLE_CLOUD_PROJECT, CLOUD_SQL_INSTANCE, CLOUD_SQL_REGION"
-    exit 1
-fi
-
-echo ""
-echo "📋 Configuration:"
-echo "   Project: $GOOGLE_CLOUD_PROJECT"
-echo "   Region: $CLOUD_SQL_REGION"
-echo "   Instance: $CLOUD_SQL_INSTANCE"
-echo ""
-
-# Set project
-echo "1️⃣  Setting GCloud project..."
-gcloud config set project $GOOGLE_CLOUD_PROJECT
-
-# Get default service account
-DEFAULT_SA="${GOOGLE_CLOUD_PROJECT}@appspot.gserviceaccount.com"
-COMPUTE_SA="$(gcloud iam service-accounts list --filter="email ~ compute@developer" --format="value(email)" | head -1)"
-
-if [ -z "$COMPUTE_SA" ]; then
-    echo "⚠️  Compute Engine default service account not found"
-    echo "   Using App Engine default: $DEFAULT_SA"
-    SERVICE_ACCOUNT=$DEFAULT_SA
-else
-    echo "✅ Found Compute Engine service account: $COMPUTE_SA"
-    SERVICE_ACCOUNT=$COMPUTE_SA
-fi
-
-echo ""
-echo "2️⃣  Granting Cloud SQL Client role to service account..."
-gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
-    --member="serviceAccount:${SERVICE_ACCOUNT}" \
-    --role="roles/cloudsql.client" \
-    --condition=None
-
-echo ""
-echo "3️⃣  Granting Cloud SQL Instance User role..."
-gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
-    --member="serviceAccount:${SERVICE_ACCOUNT}" \
-    --role="roles/cloudsql.instanceUser" \
-    --condition=None
-
-echo ""
-echo "4️⃣  Checking Cloud SQL instance status..."
-INSTANCE_STATUS=$(gcloud sql instances describe $CLOUD_SQL_INSTANCE \
-    --project=$GOOGLE_CLOUD_PROJECT \
-    --format="value(state)" 2>/dev/null || echo "NOT_FOUND")
-
-if [ "$INSTANCE_STATUS" = "NOT_FOUND" ]; then
-    echo "❌ Cloud SQL instance '$CLOUD_SQL_INSTANCE' not found"
-    echo ""
-    echo "💡 To create the instance, run:"
-    echo "   gcloud sql instances create $CLOUD_SQL_INSTANCE \\"
-    echo "     --database-version=POSTGRES_15 \\"
-    echo "     --tier=db-f1-micro \\"
-    echo "     --region=$CLOUD_SQL_REGION \\"
-    echo "     --network=default \\"
-    echo "     --database-flags=cloudsql.iam_authentication=on"
-    exit 1
-elif [ "$INSTANCE_STATUS" != "RUNNABLE" ]; then
-    echo "⚠️  Instance is in state: $INSTANCE_STATUS (waiting for RUNNABLE)"
-    echo "   This may take a few minutes..."
-else
-    echo "✅ Instance is RUNNABLE"
-fi
-
-echo ""
-echo "5️⃣  Enabling IAM authentication on the instance..."
-gcloud sql instances patch $CLOUD_SQL_INSTANCE \
-    --project=$GOOGLE_CLOUD_PROJECT \
-    --database-flags=cloudsql.iam_authentication=on \
-    --quiet || echo "⚠️  IAM authentication may already be enabled"
-
-echo ""
-echo "6️⃣  Creating IAM database user..."
-# Extract username from service account email (part before @)
-DB_IAM_USER=$(echo $SERVICE_ACCOUNT | cut -d'@' -f1 | tr '.' '_' | tr '-' '_')
-
-echo "   Creating user: $DB_IAM_USER"
-echo "   (mapped from: $SERVICE_ACCOUNT)"
-
-# Try to create the IAM user
-gcloud sql users create $DB_IAM_USER \
-    --instance=$CLOUD_SQL_INSTANCE \
-    --project=$GOOGLE_CLOUD_PROJECT \
-    --type=CLOUD_IAM_SERVICE_ACCOUNT 2>/dev/null || echo "   (User may already exist)"
-
-echo ""
-echo "7️⃣  Setting up database permissions..."
-echo "   You'll need to run these SQL commands to grant permissions:"
-echo ""
-echo "   -- Connect to your database:"
-echo "   gcloud sql connect $CLOUD_SQL_INSTANCE --user=postgres --database=pncp_medical_data"
-echo ""
-echo "   -- Then run these SQL commands:"
-echo "   GRANT CONNECT ON DATABASE pncp_medical_data TO \"$DB_IAM_USER\";"
-echo "   GRANT USAGE ON SCHEMA public TO \"$DB_IAM_USER\";"
-echo "   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"$DB_IAM_USER\";"
-echo "   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO \"$DB_IAM_USER\";"
-echo "   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"$DB_IAM_USER\";"
-echo "   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO \"$DB_IAM_USER\";"
-echo ""
-
-echo "=================================="
-echo "✅ IAM Authentication Setup Complete"
-echo "=================================="
-echo ""
-echo "📝 Update your .env file with:"
-echo "   DB_USER=$SERVICE_ACCOUNT"
-echo "   # Remove DB_PASSWORD (not needed with IAM auth)"
-echo ""
-echo "🔑 The service account will authenticate using your gcloud credentials"
-echo ""
-echo "⚠️  Don't forget to run the SQL grant commands above!"
-
-
-#!/usr/bin/env python3
-"""
-Setup schema using owner account and grant permissions to service account
-"""
-
-import asyncio
-import os
-from dotenv import load_dotenv
-from google.cloud.sql.connector import Connector
-
-load_dotenv()
-
-# Table creation statements
-TABLES = {
-    'organizations': """
-        CREATE TABLE IF NOT EXISTS organizations (
-            id SERIAL PRIMARY KEY,
-            cnpj VARCHAR(18) UNIQUE NOT NULL,
-            name VARCHAR(500) NOT NULL,
-            government_level VARCHAR(50) NOT NULL,
-            organization_type VARCHAR(50),
-            state_code VARCHAR(2),
-            municipality_name VARCHAR(200),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """,
-    'tenders': """
-        CREATE TABLE IF NOT EXISTS tenders (
-            id SERIAL PRIMARY KEY,
-            organization_id INTEGER REFERENCES organizations(id),
-            cnpj VARCHAR(18) NOT NULL,
-            ano INTEGER NOT NULL,
-            sequencial INTEGER NOT NULL,
-            control_number VARCHAR(50) UNIQUE,
-            title VARCHAR(1000),
-            description TEXT,
-            government_level VARCHAR(50) NOT NULL,
-            tender_size VARCHAR(20) NOT NULL,
-            contracting_modality INTEGER,
-            modality_name VARCHAR(100),
-            total_estimated_value DECIMAL(15,2),
-            total_homologated_value DECIMAL(15,2),
-            publication_date DATE,
-            state_code VARCHAR(2),
-            municipality_code VARCHAR(10),
-            status VARCHAR(50) DEFAULT 'discovered',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """,
-    'tender_items': """
-        CREATE TABLE IF NOT EXISTS tender_items (
-            id SERIAL PRIMARY KEY,
-            tender_id INTEGER REFERENCES tenders(id),
-            item_number INTEGER,
-            description TEXT,
-            quantity DECIMAL(15,3),
-            unit VARCHAR(50),
-            unit_price DECIMAL(15,2),
-            total_price DECIMAL(15,2),
-            matched_product_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """,
-    'matched_products': """
-        CREATE TABLE IF NOT EXISTS matched_products (
-            id SERIAL PRIMARY KEY,
-            tender_item_id INTEGER REFERENCES tender_items(id),
-            product_code VARCHAR(100),
-            product_name VARCHAR(500),
-            match_score DECIMAL(5,2),
-            fob_price_usd DECIMAL(15,2),
-            fob_price_brl DECIMAL(15,2),
-            price_difference_pct DECIMAL(5,2),
-            is_competitive BOOLEAN,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """,
-    'processing_log': """
-        CREATE TABLE IF NOT EXISTS processing_log (
-            id SERIAL PRIMARY KEY,
-            process_type VARCHAR(100),
-            state_code VARCHAR(2),
-            status VARCHAR(50),
-            records_processed INTEGER DEFAULT 0,
-            records_matched INTEGER DEFAULT 0,
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP,
-            error_message TEXT,
-            metadata JSONB
-        )
-    """,
-    'homologated_results': """
-        CREATE TABLE IF NOT EXISTS homologated_results (
-            id SERIAL PRIMARY KEY,
-            tender_id INTEGER REFERENCES tenders(id),
-            item_number INTEGER,
-            supplier_cnpj VARCHAR(18),
-            supplier_name VARCHAR(500),
-            homologated_unit_price DECIMAL(15,2),
-            homologated_quantity DECIMAL(15,3),
-            homologated_total_price DECIMAL(15,2),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """
-}
-
-async def setup_schema():
-    """Create schema using owner account"""
-
-    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
-    region = os.getenv('CLOUD_SQL_REGION')
-    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
-    database_name = os.getenv('DATABASE_NAME')
-    service_account_user = "pncp-medical-app@medical-473219.iam"
-
-    connection_name = f"{project_id}:{region}:{instance_name}"
-
-    print("=" * 70)
-    print("Setup Database Schema (as Owner)")
-    print("=" * 70)
-    print(f"\nConnection: {connection_name}")
-    print(f"Database: {database_name}")
-    print(f"User: gabrielreginatto@gmail.com (owner)")
-
-    connector = Connector()
-
-    try:
-        print("\n1️⃣  Connecting to Cloud SQL as owner...")
-        conn = await connector.connect_async(
-            instance_connection_string=connection_name,
-            driver="asyncpg",
-            user="gabrielreginatto@gmail.com",
-            db=database_name,
-            enable_iam_auth=True,
-            ip_type="public"
-        )
-        print("   ✅ Connected successfully")
-
-        print("\n2️⃣  Creating tables...")
-        for table_name, create_stmt in TABLES.items():
+    # Get end date
+    while True:
+        end_date = input("📅 Enter END DATE (YYYYMMDD, e.g., 20240131): ").strip()
+        if len(end_date) == 8 and end_date.isdigit():
             try:
-                await conn.execute(create_stmt)
-                print(f"   ✅ {table_name}")
-            except Exception as e:
-                print(f"   ⚠️  {table_name}: {e}")
-
-        print("\n3️⃣  Granting permissions to service account...")
-        print(f"   Service Account: {service_account_user}")
-
-        # Grant all permissions on all tables
-        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "{service_account_user}"')
-        print("   ✅ Granted ALL on tables")
-
-        # Grant all permissions on all sequences
-        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "{service_account_user}"')
-        print("   ✅ Granted ALL on sequences")
-
-        # Grant default privileges for future objects
-        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO "{service_account_user}"')
-        print("   ✅ Granted default privileges on tables")
-
-        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO "{service_account_user}"')
-        print("   ✅ Granted default privileges on sequences")
-
-        print("\n4️⃣  Verifying tables...")
-        tables = await conn.fetch("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-            ORDER BY table_name
-        """)
-
-        print(f"   ✅ Found {len(tables)} tables:")
-        for table in tables:
-            print(f"      - {table['table_name']}")
-
-        await conn.close()
-
-        print("\n" + "=" * 70)
-        print("✅ Schema Setup Complete!")
-        print("=" * 70)
-        print(f"\nService account '{service_account_user}' now has:")
-        print("  • ALL privileges on all tables")
-        print("  • ALL privileges on all sequences")
-        print("  • Default privileges for future objects")
-
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-    finally:
-        await connector.close_async()
-
-if __name__ == "__main__":
-    asyncio.run(setup_schema())
-
-
-    #!/usr/bin/env python3
-"""
-Setup schema using postgres user and grant permissions to service account
-"""
-
-import asyncio
-from dotenv import load_dotenv
-from google.cloud.sql.connector import Connector
-import os
-
-load_dotenv()
-
-# Table definitions (abbreviated for speed)
-SCHEMA_SQL = open('schema.sql', 'r').read()
-
-async def setup():
-    """Create schema using postgres user"""
-
-    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
-    region = os.getenv('CLOUD_SQL_REGION')
-    instance_name = os.getenv('CLOUD_SQL_INSTANCE')
-    database_name = os.getenv('DATABASE_NAME')
-    service_account_user = "pncp-medical-app@medical-473219.iam"
-
-    connection_name = f"{project_id}:{region}:{instance_name}"
-
-    print("=" * 70)
-    print("Setup Database Schema")
-    print("=" * 70)
-
-    connector = Connector()
-
-    try:
-        print("\n1️⃣  Connecting as postgres...")
-        conn = await connector.connect_async(
-            instance_connection_string=connection_name,
-            driver="asyncpg",
-            user="postgres",
-            password="TempPass123!",
-            db=database_name,
-            ip_type="public"
-        )
-        print("   ✅ Connected")
-
-        print("\n2️⃣  Creating tables...")
-        statements = [s.strip() for s in SCHEMA_SQL.split(';') if s.strip() and 'CREATE TABLE' in s.upper()]
-
-        for stmt in statements:
-            try:
-                await conn.execute(stmt)
-                # Extract table name
-                if 'IF NOT EXISTS' in stmt.upper():
-                    table_name = stmt.split('IF NOT EXISTS')[1].split('(')[0].strip()
+                datetime.strptime(end_date, '%Y%m%d')
+                if end_date >= start_date:
+                    break
                 else:
-                    table_name = stmt.split('CREATE TABLE')[1].split('(')[0].strip()
-                print(f"   ✅ {table_name}")
-            except Exception as e:
-                print(f"   ⚠️  Error: {e}")
+                    print("❌ End date must be after or equal to start date")
+            except ValueError:
+                print("❌ Invalid date. Please use format YYYYMMDD")
+        else:
+            print("❌ Invalid format. Please enter 8 digits (YYYYMMDD)")
 
-        print("\n3️⃣  Granting permissions to service account...")
-        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "{service_account_user}"')
-        await conn.execute(f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "{service_account_user}"')
-        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "{service_account_user}"')
-        await conn.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "{service_account_user}"')
-        print(f"   ✅ Granted all privileges to {service_account_user}")
+    # Show available states
+    print("\n🗺️  Available Brazilian States:")
+    print("-" * 70)
+    states_list = list(BRAZILIAN_STATES.items())
+    for i in range(0, len(states_list), 3):
+        row = states_list[i:i+3]
+        print("  " + " | ".join([f"{code}: {name:20}" for code, name in row]))
+    print("-" * 70)
 
-        print("\n4️⃣  Verifying...")
-        tables = await conn.fetch("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name")
-        print(f"   ✅ {len(tables)} tables created:")
-        for t in tables:
-            print(f"      - {t['table_name']}")
+    # Get states
+    while True:
+        states_input = input("\n🌎 Enter STATE CODES (space-separated, e.g., SP RJ MG) or 'ALL': ").strip().upper()
 
-        await conn.close()
+        if states_input == 'ALL':
+            states = list(BRAZILIAN_STATES.keys())
+            print(f"✅ Selected ALL states ({len(states)} total)")
+            break
 
-        print("\n" + "=" * 70)
-        print("✅ Setup Complete!")
-        print("=" * 70)
+        states = states_input.split()
+        invalid_states = [s for s in states if s not in BRAZILIAN_STATES]
+
+        if invalid_states:
+            print(f"❌ Invalid state codes: {', '.join(invalid_states)}")
+            print("   Please use valid 2-letter codes (e.g., SP, RJ, MG)")
+        elif len(states) == 0:
+            print("❌ Please enter at least one state code")
+        else:
+            state_names = [BRAZILIAN_STATES[s] for s in states]
+            print(f"✅ Selected {len(states)} state(s): {', '.join(state_names)}")
+            break
+
+    # Confirm
+    print("\n" + "=" * 70)
+    print("📋 CONFIGURATION SUMMARY")
+    print("=" * 70)
+    print(f"Start Date: {start_date}")
+    print(f"End Date:   {end_date}")
+    print(f"States:     {', '.join(states)} ({len(states)} total)")
+    print("=" * 70)
+
+    confirm = input("\n▶️  Proceed with this configuration? (yes/no): ").strip().lower()
+
+    if confirm not in ['yes', 'y']:
+        print("❌ Operation cancelled by user")
+        return None, None, None
+
+    return start_date, end_date, states
+
+
+async def main():
+    """Main entry point"""
+
+    parser = argparse.ArgumentParser(
+        description='PNCP Medical Data Processor',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full workflow
+  python main.py --start-date 20240101 --end-date 20240131 --states SP RJ
+
+  # Discovery only
+  python main.py --start-date 20240101 --end-date 20240131 --discovery-only
+
+  # Process items for existing tenders
+  python main.py --items-only
+
+  # Match products only
+  python main.py --matching-only
+
+  # Export to Notion only
+  python main.py --export-only
+        """
+    )
+
+    parser.add_argument('--start-date', help='Start date (YYYYMMDD)')
+    parser.add_argument('--end-date', help='End date (YYYYMMDD)')
+    parser.add_argument('--states', nargs='*', help='State codes (e.g., SP RJ MG)')
+    parser.add_argument('--match', action='store_true', help='Enable Phase 3 product matching (default: skip)')
+    parser.add_argument('--discovery-only', action='store_true', help='Only run discovery phase')
+    parser.add_argument('--items-only', action='store_true', help='Only fetch items (skip discovery)')
+    parser.add_argument('--matching-only', action='store_true', help='Only match products (skip discovery/items)')
+    parser.add_argument('--export-only', action='store_true', help='Only export to Notion')
+
+    args = parser.parse_args()
+
+    # Check if running in interactive mode (no arguments provided)
+    phases = [args.discovery_only, args.items_only, args.matching_only, args.export_only]
+    interactive_mode = not any(phases) and not args.start_date and not args.end_date
+
+    # Validate phase arguments
+    if sum(phases) > 1:
+        logger.error("❌ Please specify only one phase flag")
+        return
+
+    # Interactive mode for full workflow
+    if interactive_mode:
+        start_date, end_date, states = get_interactive_input()
+        if not start_date:  # User cancelled
+            return
+        args.start_date = start_date
+        args.end_date = end_date
+        args.states = states
+
+    # Validate required arguments for specific modes
+    if not any(phases) and (not args.start_date or not args.end_date):
+        logger.error("❌ Full workflow requires --start-date and --end-date")
+        return
+
+    if args.discovery_only and (not args.start_date or not args.end_date):
+        logger.error("❌ Discovery requires --start-date and --end-date")
+        return
+
+    # Determine run mode for logging
+    if args.discovery_only:
+        run_mode = "discovery"
+    elif args.items_only:
+        run_mode = "items"
+    elif args.matching_only:
+        run_mode = "matching"
+    elif args.export_only:
+        run_mode = "export"
+    else:
+        run_mode = "full"
+
+    # Setup logging
+    log_file = setup_logging(run_mode)
+
+    # Create processor
+    config = ProcessingConfig()
+    processor = PNCPMedicalProcessor(config)
+
+    try:
+        if args.discovery_only:
+            await processor.initialize()
+            await processor.discover_tenders(args.start_date, args.end_date, args.states)
+
+        elif args.items_only:
+            await processor.initialize()
+            await processor.fetch_items()
+
+        elif args.matching_only:
+            await processor.initialize()
+            await processor.match_products()
+
+        elif args.export_only:
+            await processor.initialize()
+            await processor.export_to_notion_db()
+
+        else:
+            # Full workflow
+            await processor.run_complete_workflow(args.start_date, args.end_date, args.states, enable_matching=args.match)
+
+        logger.info(f"\n📝 Full log saved to: {log_file}")
+
+    except KeyboardInterrupt:
+        logger.info("\n⚠️  Process interrupted by user")
 
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        logger.error(f"❌ Process failed: {e}", exc_info=True)
         raise
+
     finally:
-        await connector.close_async()
+        await processor.cleanup()
+
 
 if __name__ == "__main__":
-    asyncio.run(setup())
+    asyncio.run(main())

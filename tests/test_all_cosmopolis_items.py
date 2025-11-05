@@ -8,11 +8,12 @@ import sys
 import os
 import json
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src', 'lacre'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src', 'medical'))
-sys.path.insert(0, os.path.dirname(__file__))
+# Add parent directory and src directory to path
+parent_dir = os.path.join(os.path.dirname(__file__), '..')
+sys.path.insert(0, parent_dir)
+sys.path.insert(0, os.path.join(parent_dir, 'src'))
 
-from pncp_api import PNCPAPIClient
+from src.pncp_api import PNCPAPIClient
 
 async def test_all_items():
     """Get ALL items with pagination"""
