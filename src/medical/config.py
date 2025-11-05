@@ -3,6 +3,7 @@ Configuration module for PNCP API Integration
 Contains Brazilian states, tender classifications, and system configurations
 """
 
+import os
 from enum import Enum
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -144,38 +145,10 @@ class ProcessingConfig:
                 OrganizationType.GOVERNMENT_AGENCY
             ]
 
-class DatabaseConfig:
-    """GCP Cloud SQL (PostgreSQL) database configuration"""
-
-    # Table names
-    TENDERS_TABLE = "tenders"
-    TENDER_ITEMS_TABLE = "tender_items"
-    ORGANIZATIONS_TABLE = "organizations"
-    MATCHED_PRODUCTS_TABLE = "matched_products"
-    HOMOLOGATED_RESULTS_TABLE = "homologated_results"
-    PROCESSING_LOG_TABLE = "processing_log"
-
-    # Batch sizes for processing
-    TENDER_BATCH_SIZE = 100
-    ITEM_BATCH_SIZE = 50
-
-    # Cloud SQL connection settings
-    MAX_CONNECTIONS = 20
-    CONNECTION_TIMEOUT = 30
-
-    # GCP Cloud SQL specific settings
-    CLOUD_SQL_CONNECTION_NAME = None  # Format: project:region:instance
-    DATABASE_NAME = "pncp_medical_data"
-
-    # Connection options
-    USE_IAM_AUTH = True  # Use IAM database authentication
-    USE_PRIVATE_IP = True  # Connect via private IP
-
-    # SSL settings
-    SSL_MODE = "require"
-    SSL_CERT_PATH = None  # Path to client cert if needed
-    SSL_KEY_PATH = None   # Path to client key if needed
-    SSL_ROOT_CERT_PATH = None  # Path to server CA cert if needed
+# Import DatabaseConfig from shared location (for backwards compatibility)
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from database_config import DatabaseConfig
 
 class APIConfig:
     """PNCP API configuration"""
