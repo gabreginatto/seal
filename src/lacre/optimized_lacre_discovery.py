@@ -582,6 +582,16 @@ class OptimizedLacreDiscovery:
                     tender_size = 'mega'
 
                 # Prepare tender data
+                # Convert publication date string to datetime.date object
+                publication_date = None
+                if tender.get('dataPublicacaoPncp'):
+                    try:
+                        date_str = tender.get('dataPublicacaoPncp')[:10]  # Get YYYY-MM-DD
+                        publication_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Failed to parse date '{tender.get('dataPublicacaoPncp')}': {e}")
+                        publication_date = None
+
                 tender_data = {
                     'organization_id': org_id,
                     'cnpj': cnpj,
@@ -596,7 +606,7 @@ class OptimizedLacreDiscovery:
                     'modality_name': tender.get('modalidadeNome', ''),
                     'total_estimated_value': estimated_value,
                     'total_homologated_value': homologated_value,
-                    'publication_date': tender.get('dataPublicacaoPncp', '')[:10] if tender.get('dataPublicacaoPncp') else None,
+                    'publication_date': publication_date,
                     'state_code': state,
                     'municipality_code': tender.get('codigoIbgeMunicipio'),
                     'status': tender.get('situacaoCompra') or tender.get('situacao') or 'discovered'
