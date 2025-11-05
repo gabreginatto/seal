@@ -197,29 +197,22 @@ class OptimizedLacreDiscovery:
 
                 score = self._count_lacre_keywords(title, description)
 
-                # Apply value filters
-                estimated_value = tender.get('valorTotalEstimado', 0) or 0
-                homologated_value = tender.get('valorTotalHomologado', 0) or 0
-                tender_value = max(estimated_value, homologated_value)
+                # Apply value filters (use homologated value like Medical system)
+                homologated_value = tender.get('valorTotalHomologado') or 0
 
                 # Skip if value is below minimum
-                if tender_value < self.config.min_tender_value:
+                if homologated_value < self.config.min_tender_value:
                     continue
 
-                if self.config.max_tender_value and tender_value > self.config.max_tender_value:
+                if self.config.max_tender_value and homologated_value > self.config.max_tender_value:
                     continue
 
-                # Check if ongoing (for lacre we want ongoing tenders)
-                status = tender.get('situacaoCompra', '') or tender.get('situacao', '')
-                is_ongoing = any(keyword in status.lower() for keyword in ['andamento', 'aberta', 'divulgada'])
-
-                if self.config.only_ongoing_tenders and not is_ongoing:
-                    continue
+                # Note: Removed ongoing status filter - we process all tenders now
+                # The config.only_ongoing_tenders controls Stage 1 API calls, not Stage 2 filtering
 
                 # Threshold for proceeding to next stage
                 if score >= 1:  # At least 1 lacre keyword
                     tender['quick_filter_score'] = score
-                    tender['is_ongoing'] = is_ongoing
                     filtered.append(tender)
 
             except Exception as e:
@@ -245,12 +238,35 @@ class OptimizedLacreDiscovery:
         count = sum(1 for keyword in LACRE_KEYWORDS if keyword in text)
         return count
 
+    def _count_lacre_keywords_in_object(self, objeto: str) -> int:
+        """Count strong lacre keywords in tender object description"""
+        if not objeto:
+            return 0
+
+        objeto_lower = objeto.lower()
+
+        # Strong lacre keywords that are highly indicative
+        strong_keywords = [
+            'lacre', 'lacres',
+            'lacre de segurança', 'lacre inviolável', 'lacre antifraude',
+            'lacre numerado', 'lacre sequencial',
+            'seal', 'seals', 'security seal', 'tamper evident',
+            'selo-lacre', 'etiqueta void', 'void label',
+            'lacre plástico', 'lacre metálico',
+            'lacre para hidrômetro', 'lacre medidor',
+            'pulseira inviolável', 'pulseira com lacre',
+            'envelope de segurança', 'envelope lacrado',
+            'dispositivo de segurança', 'dispositivo inviolável'
+        ]
+
+        return sum(1 for keyword in strong_keywords if keyword in objeto_lower)
+
     async def _stage3_smart_sampling(self, tenders: List[Dict]) -> List[Dict]:
         """
-        Stage 3: HYBRID Smart Sampling
-        - Auto-approve high-confidence tenders (score >= 3 lacre keywords)
-        - Only sample items for medium-confidence edge cases (1-2 keywords)
-        Strategy: Trust title/description, only verify edge cases
+        Stage 3: HYBRID Smart Sampling (matching Medical system)
+        - Auto-approve high-confidence tenders (score >= 70 OR 2+ keywords)
+        - Only sample items for medium-confidence edge cases
+        Strategy: Trust objetoCompra field, only verify edge cases
         """
         start_time = datetime.now()
         self.metrics.stage3_smart_sampling.tenders_in = len(tenders)
@@ -262,23 +278,28 @@ class OptimizedLacreDiscovery:
 
         # PHASE 1: Auto-approve high-confidence tenders (NO API CALLS)
         for tender in tenders:
+            # Get the quick filter score that was already calculated
             quick_score = tender.get('quick_filter_score', 0)
+            objeto = tender.get('objetoCompra', '')
+
+            # Count lacre keywords in object
+            lacre_keyword_count = self._count_lacre_keywords_in_object(objeto)
 
             # AUTO-APPROVE CONDITIONS (skip API calls):
-            # 1. High confidence score (>= 3 lacre keywords)
-            # 2. Very clear lacre description
-            if quick_score >= 3:
+            # 1. High confidence score (>= 70)
+            # 2. Multiple lacre keywords (>= 2) in object
+            # 3. Very high score (>= 80) from keywords alone
+            if quick_score >= 70 or lacre_keyword_count >= 2 or quick_score >= 80:
                 # High confidence - approve without sampling
-                tender['lacre_confidence'] = min(60 + (quick_score * 10), 95)
+                confidence = max(quick_score, 60 + (lacre_keyword_count * 10))
+                confidence = min(confidence, 95)  # Cap at 95
+
+                tender['lacre_confidence'] = confidence
                 tender['auto_approved'] = True
-                tender['approval_reason'] = f'keywords={quick_score}'
+                tender['approval_reason'] = f'score={quick_score}, keywords={lacre_keyword_count}'
                 confirmed.append(tender)
 
-                # Cache org
-                cnpj = self._normalize_cnpj(tender.get('orgaoEntidade', {}).get('cnpj', '') or tender.get('cnpj', ''))
-                self.lacre_orgs_cache.add(cnpj)
-
-                logger.debug(f"Auto-approved tender {tender.get('numeroControlePNCPCompra')}: keywords={quick_score}")
+                logger.debug(f"Auto-approved tender {tender.get('numeroControlePNCPCompra')}: score={quick_score}, keywords={lacre_keyword_count}")
             else:
                 # Medium confidence - needs item sampling to verify
                 needs_sampling.append(tender)
@@ -315,13 +336,13 @@ class OptimizedLacreDiscovery:
                     # Quick analysis of sample
                     lacre_confidence = self._analyze_sample_items(sample_items)
 
-                    if lacre_confidence > 40:
+                    if lacre_confidence > 50:  # Match Medical system threshold
                         tender['lacre_confidence'] = lacre_confidence
                         tender['sample_items'] = sample_items  # Cache for Stage 4
                         tender['sample_count'] = len(sample_items)
 
                         # Update org cache
-                        if lacre_confidence > 60:
+                        if lacre_confidence > 70:  # Match Medical system threshold
                             cnpj_normalized = self._normalize_cnpj(cnpj)
                             self.lacre_orgs_cache.add(cnpj_normalized)
 
@@ -350,6 +371,30 @@ class OptimizedLacreDiscovery:
                 await asyncio.sleep(1)
 
         logger.info(f"📊 Stage 3 Phase 2: {len(needs_sampling)} sampled, {api_calls} API calls")
+
+        # PHASE 3: Auto-approve from confirmed lacre orgs
+        # If we found 2+ lacre tenders from same org, trust remaining tenders from that org
+        org_tender_counts = {}
+        for tender in confirmed:
+            cnpj = self._normalize_cnpj(tender.get('orgaoEntidade', {}).get('cnpj', '') or tender.get('cnpj', ''))
+            org_tender_counts[cnpj] = org_tender_counts.get(cnpj, 0) + 1
+
+        # Check tenders that weren't sampled yet
+        confirmed_control_numbers = {t.get('numeroControlePNCPCompra') for t in confirmed if t.get('numeroControlePNCPCompra')}
+        remaining_from_sampling = [t for t in needs_sampling if t.get('numeroControlePNCPCompra') not in confirmed_control_numbers]
+
+        org_approved = 0
+        for tender in remaining_from_sampling:
+            cnpj = self._normalize_cnpj(tender.get('orgaoEntidade', {}).get('cnpj', '') or tender.get('cnpj', ''))
+            if cnpj in org_tender_counts and org_tender_counts[cnpj] >= 2:
+                tender['lacre_confidence'] = 75
+                tender['auto_approved'] = True
+                tender['approval_reason'] = 'org_history'
+                confirmed.append(tender)
+                org_approved += 1
+
+        if org_approved > 0:
+            logger.info(f"📊 Stage 3 Phase 3: {org_approved} org-approved from lacre organizations")
 
         # Update metrics
         self.metrics.stage3_smart_sampling.tenders_out = len(confirmed)
@@ -416,23 +461,22 @@ class OptimizedLacreDiscovery:
                             items = tender['sample_items']
                             api_calls += 0  # Using cached data
                         else:
-                            api_calls += 0  # Would fetch items here if needed
+                            # Note: Full item fetching would happen here if needed
+                            api_calls += 0
 
-                        # Classify tender using lacre classifier
+                        # Classify tender using lacre classifier (for metadata, not filtering)
                         title = tender.get('objetoCompra', '')
                         description = tender.get('descricao', '')
                         is_relevant, score, keywords, reasoning = self.classifier.assess_lacre_relevance(title, description)
 
-                        if is_relevant:
-                            tender['lacre_classification'] = {
-                                'is_relevant': is_relevant,
-                                'score': score,
-                                'keywords': keywords,
-                                'reasoning': reasoning
-                            }
-                            return tender
-
-                        return None
+                        # Always keep the tender (don't reject here like Medical system)
+                        tender['lacre_classification'] = {
+                            'is_relevant': is_relevant,
+                            'score': score,
+                            'keywords': keywords,
+                            'reasoning': reasoning
+                        }
+                        return tender
 
                     except Exception as e:
                         logger.error(f"Processing error for {tender.get('numeroControlePNCPCompra')}: {e}")

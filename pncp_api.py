@@ -255,7 +255,7 @@ class PNCPAPIClient:
         return await self._make_request('GET', url, params=params)
 
     async def get_tender_items(self, cnpj: str, year: int, sequential: int) -> Tuple[int, Dict[str, Any]]:
-        """Get all items for a specific tender"""
+        """Get all items for a specific tender (with pagination support)"""
         # Try to authenticate if credentials provided, otherwise use public access
         if self.username and self.password:
             if not self.auth_token or self.auth_token.is_expired():
@@ -263,10 +263,50 @@ class PNCPAPIClient:
                 if not authenticated:
                     return 401, {'error': 'Authentication failed'}
 
-        url = f"{self.base_url}/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens"
+        # Use /api/pncp/v1/ endpoint which supports pagination
+        url = "https://pncp.gov.br/api/pncp/v1/orgaos/{}/compras/{}/{}/itens".format(cnpj, year, sequential)
         headers = self._get_auth_headers()
 
-        return await self._make_request('GET', url, headers=headers)
+        # Fetch all pages
+        all_items = []
+        page = 1
+
+        while True:
+            params = {'pagina': page, 'tamanhoPagina': 100}
+            status, response = await self._make_request('GET', url, headers=headers, params=params)
+
+            if status != 200:
+                if page == 1:
+                    return status, response
+                else:
+                    # Already got some items, return what we have
+                    break
+
+            # Handle both list and dict responses
+            if isinstance(response, list):
+                items = response
+            else:
+                items = response.get('data', [])
+
+            if not items:
+                break
+
+            all_items.extend(items)
+
+            # Check for more pages
+            if isinstance(response, dict):
+                has_more = response.get('paginasRestantes', 0) > 0
+                if not has_more:
+                    break
+
+            page += 1
+
+            # Safety limit: max 20 pages (2000 items)
+            if page > 20:
+                logger.warning(f"Reached pagination limit for {cnpj}/{year}/{sequential}")
+                break
+
+        return 200, {'data': all_items}
 
     async def fetch_sample_items(self, cnpj: str, year: int, sequential: int, max_items: int = 3) -> List[Dict[str, Any]]:
         """

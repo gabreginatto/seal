@@ -7,7 +7,10 @@ from enum import Enum
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
-# Import shared configurations from base config
+# Import shared configurations from base config (medical config has base definitions)
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'medical'))
 from config import (
     BRAZILIAN_STATES, GovernmentLevel, TenderSize, OrganizationType,
     CONTRACTING_MODALITIES, TenderSizeThresholds, DatabaseConfig, APIConfig,
@@ -81,8 +84,8 @@ class LacreProcessingConfig:
     allowed_lacre_materials: List[LacreMaterial] = None
     allowed_lacre_applications: List[LacreApplication] = None
 
-    # Filter for ongoing tenders only
-    only_ongoing_tenders: bool = True
+    # Filter for ongoing tenders only (set to False to include completed tenders)
+    only_ongoing_tenders: bool = False
 
     def __post_init__(self):
         """Set defaults for None values"""
@@ -97,11 +100,13 @@ class LacreProcessingConfig:
             ]
 
         if self.allowed_modalities is None:
-            # Focus on modalities with ONGOING lacre tenders
+            # Use same modalities as Medical system for consistency
+            # 1: Leilão Eletrônico
+            # 4: Concorrência Eletrônica
             # 6: Pregão Eletrônico (80% of tenders) - HIGHEST PRIORITY
+            # 8: Dispensa de Licitação
             # 12: Credenciamento (ongoing supply contracts) - Perfect for lacre seals
-            # Removed: 4 (invalid page size issues), 8 (mostly completed tenders)
-            self.allowed_modalities = [6, 12]
+            self.allowed_modalities = [1, 4, 6, 8, 12]
 
         if self.allowed_org_types is None:
             # Lacres are used by various government agencies
