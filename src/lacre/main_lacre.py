@@ -15,15 +15,15 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from config_lacre import (
+from .config_lacre import (
     LacreProcessingConfig, LacreDatabaseConfig, get_state_codes,
     BRAZILIAN_STATES, DEFAULT_LACRE_CONFIG
 )
-from database_lacre import create_lacre_db_manager_from_env, LacreDatabaseOperations
-from pncp_api import PNCPAPIClient, test_api_connection
-from classifier_lacre import LacreTenderClassifier
-from optimized_lacre_discovery import OptimizedLacreDiscovery, print_metrics_summary
-from processed_lacre_tenders_tracker import (
+from .database_lacre import create_lacre_db_manager_from_env, LacreDatabaseOperations
+from .pncp_api import PNCPAPIClient, test_api_connection
+from .classifier_lacre import LacreTenderClassifier
+from .optimized_lacre_discovery import OptimizedLacreDiscovery, print_metrics_summary
+from .processed_lacre_tenders_tracker import (
     ProcessedLacreTendersTracker, LacreTenderIdentifier, get_processed_lacre_tenders_tracker
 )
 

@@ -7,7 +7,7 @@ import os
 import logging
 from typing import Dict, List, Optional, Any
 from database import CloudSQLManager, DatabaseOperations, DATABASE_SCHEMA
-from config_lacre import LacreDatabaseConfig
+from .config_lacre import LacreDatabaseConfig
 
 logger = logging.getLogger(__name__)
 

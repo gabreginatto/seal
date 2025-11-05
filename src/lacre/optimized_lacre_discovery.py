@@ -16,10 +16,10 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 
-from config_lacre import LacreProcessingConfig, LACRE_KEYWORDS
-from pncp_api import PNCPAPIClient
-from classifier_lacre import LacreTenderClassifier
-from database_lacre import LacreDatabaseOperations
+from .config_lacre import LacreProcessingConfig, LACRE_KEYWORDS
+from .pncp_api import PNCPAPIClient
+from .classifier_lacre import LacreTenderClassifier
+from .database_lacre import LacreDatabaseOperations
 
 logger = logging.getLogger(__name__)
 

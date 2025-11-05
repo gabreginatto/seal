@@ -7,7 +7,7 @@ import re
 import logging
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
-from config_lacre import (
+from .config_lacre import (
     GovernmentLevel, TenderSize, OrganizationType,
     LacreType, LacreMaterial, LacreApplication,
     classify_tender_size, CONTRACTING_MODALITIES, BRAZILIAN_STATES,
