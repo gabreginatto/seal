@@ -166,10 +166,14 @@ CREATE TABLE IF NOT EXISTS tender_items (
     homologated_total_value DECIMAL(15,2),
     winner_name VARCHAR(500),
     winner_cnpj VARCHAR(18),
+    is_lacre BOOLEAN DEFAULT FALSE,  -- ✅ NEW: Flag to identify lacre items
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(tender_id, item_number)
 );
+
+-- Also add ALTER statement for existing databases
+ALTER TABLE tender_items ADD COLUMN IF NOT EXISTS is_lacre BOOLEAN DEFAULT FALSE;
 
 -- Matched products table
 CREATE TABLE IF NOT EXISTS matched_products (
@@ -234,6 +238,7 @@ CREATE INDEX IF NOT EXISTS idx_tenders_homologated_value ON tenders(total_homolo
 
 CREATE INDEX IF NOT EXISTS idx_tender_items_tender_id ON tender_items(tender_id);
 CREATE INDEX IF NOT EXISTS idx_tender_items_item_number ON tender_items(item_number);
+CREATE INDEX IF NOT EXISTS idx_tender_items_lacre ON tender_items(is_lacre) WHERE is_lacre = TRUE;
 
 CREATE INDEX IF NOT EXISTS idx_matched_products_tender_item_id ON matched_products(tender_item_id);
 CREATE INDEX IF NOT EXISTS idx_matched_products_fernandes_code ON matched_products(fernandes_product_code);
@@ -340,20 +345,21 @@ class DatabaseOperations:
                     tender_id, item_number, description, unit, quantity,
                     estimated_unit_value, estimated_total_value,
                     homologated_unit_value, homologated_total_value,
-                    winner_name, winner_cnpj
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    winner_name, winner_cnpj, is_lacre
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 ON CONFLICT (tender_id, item_number) DO UPDATE SET
                     homologated_unit_value = EXCLUDED.homologated_unit_value,
                     homologated_total_value = EXCLUDED.homologated_total_value,
                     winner_name = EXCLUDED.winner_name,
                     winner_cnpj = EXCLUDED.winner_cnpj,
+                    is_lacre = EXCLUDED.is_lacre,
                     updated_at = CURRENT_TIMESTAMP
             """, [
                 (item['tender_id'], item['item_number'], item['description'],
                  item.get('unit'), item.get('quantity'),
                  item.get('estimated_unit_value'), item.get('estimated_total_value'),
                  item.get('homologated_unit_value'), item.get('homologated_total_value'),
-                 item.get('winner_name'), item.get('winner_cnpj'))
+                 item.get('winner_name'), item.get('winner_cnpj'), item.get('is_lacre', False))
                 for item in items_data
             ])
         finally:

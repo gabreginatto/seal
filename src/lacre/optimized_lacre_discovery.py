@@ -263,150 +263,189 @@ class OptimizedLacreDiscovery:
 
     async def _stage3_smart_sampling(self, tenders: List[Dict]) -> List[Dict]:
         """
-        Stage 3: HYBRID Smart Sampling (matching Medical system)
-        - Auto-approve high-confidence tenders (score >= 70 OR 2+ keywords)
-        - Only sample items for medium-confidence edge cases
-        Strategy: Trust objetoCompra field, only verify edge cases
+        Stage 3: FULL ITEM ANALYSIS (NO SAMPLING - Critical for lacres!)
+
+        ⚠️  CRITICAL DIFFERENCE FROM MEDICAL PROJECT:
+        - Medical items: Homogeneous (if 3 items are medical, all 97 are likely medical)
+        - Lacre items: Heterogeneous (99 office supplies + 1 lacre = we MUST check all 100)
+
+        Strategy: Fetch ALL items for ALL tenders and analyze each one for lacres
+        This is slower but necessary because lacres can be bundled with unrelated items.
         """
         start_time = datetime.now()
         self.metrics.stage3_smart_sampling.tenders_in = len(tenders)
 
-        confirmed = []
-        needs_sampling = []
+        logger.info(f"📋 Stage 3: Full item analysis for {len(tenders)} tenders")
+        logger.info("⚠️  NO SAMPLING - Analyzing EVERY item to find lacres")
+
+        verified_tenders = []
+        items_analyzed = 0
+        tenders_with_lacres = 0
         api_calls = 0
         api_calls_lock = asyncio.Lock()
 
-        # PHASE 1: Auto-approve high-confidence tenders (NO API CALLS)
-        for tender in tenders:
-            # Get the quick filter score that was already calculated
-            quick_score = tender.get('quick_filter_score', 0)
-            objeto = tender.get('objetoCompra', '')
+        # Process in batches to manage rate limits
+        batch_size = 5  # Process 5 tenders at a time
+        semaphore = asyncio.Semaphore(batch_size)
 
-            # Count lacre keywords in object
-            lacre_keyword_count = self._count_lacre_keywords_in_object(objeto)
-
-            # AUTO-APPROVE CONDITIONS (skip API calls):
-            # 1. High confidence score (>= 70)
-            # 2. Multiple lacre keywords (>= 2) in object
-            # 3. Very high score (>= 80) from keywords alone
-            if quick_score >= 70 or lacre_keyword_count >= 2 or quick_score >= 80:
-                # High confidence - approve without sampling
-                confidence = max(quick_score, 60 + (lacre_keyword_count * 10))
-                confidence = min(confidence, 95)  # Cap at 95
-
-                tender['lacre_confidence'] = confidence
-                tender['auto_approved'] = True
-                tender['approval_reason'] = f'score={quick_score}, keywords={lacre_keyword_count}'
-                confirmed.append(tender)
-
-                logger.debug(f"Auto-approved tender {tender.get('numeroControlePNCPCompra')}: score={quick_score}, keywords={lacre_keyword_count}")
-            else:
-                # Medium confidence - needs item sampling to verify
-                needs_sampling.append(tender)
-
-        logger.info(f"📊 Stage 3 Phase 1: {len(confirmed)} auto-approved, {len(needs_sampling)} need sampling")
-
-        # PHASE 2: Sample only edge cases (API calls only when needed)
-        # Concurrent sampling with rate limiting
-        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
-
-        async def sample_tender(tender):
+        async def analyze_tender_items(tender):
+            """Analyze all items for a single tender"""
             nonlocal api_calls
 
             async with semaphore:
                 try:
-                    # Extract CNPJ from nested structure
-                    cnpj = tender.get('orgaoEntidade', {}).get('cnpj', '') or tender.get('cnpj', '')
-                    year = tender.get('ano') or tender.get('anoCompra')
-                    sequential = tender.get('sequencial') or tender.get('sequencialCompra')
+                    result = await self._analyze_all_tender_items(tender)
 
-                    if not all([cnpj, year, sequential]):
-                        return None
-
-                    # Fetch only first 3 items (HUGE API savings)
-                    sample_items = await self.api_client.fetch_sample_items(
-                        cnpj, year, sequential, max_items=3
-                    )
                     async with api_calls_lock:
-                        api_calls += 1
+                        api_calls += 1  # One API call per tender (with pagination)
 
-                    if not sample_items:
-                        return None
-
-                    # Quick analysis of sample
-                    lacre_confidence = self._analyze_sample_items(sample_items)
-
-                    if lacre_confidence > 50:  # Match Medical system threshold
-                        tender['lacre_confidence'] = lacre_confidence
-                        tender['sample_items'] = sample_items  # Cache for Stage 4
-                        tender['sample_count'] = len(sample_items)
-
-                        # Update org cache
-                        if lacre_confidence > 70:  # Match Medical system threshold
-                            cnpj_normalized = self._normalize_cnpj(cnpj)
-                            self.lacre_orgs_cache.add(cnpj_normalized)
-
-                        return tender
-
-                    # Cache as non-lacre
-                    cnpj_normalized = self._normalize_cnpj(cnpj)
-                    self.non_lacre_orgs_cache.add(cnpj_normalized)
-                    return None
+                    return result
 
                 except Exception as e:
-                    logger.warning(f"Sampling error for {tender.get('numeroControlePNCPCompra')}: {e}")
+                    logger.error(f"Error analyzing tender {tender.get('numeroControlePNCPCompra')}: {e}")
                     self.metrics.stage3_smart_sampling.errors += 1
                     return None
 
-        # Process only edge cases in batches
-        batch_size = 50
-        for i in range(0, len(needs_sampling), batch_size):
-            batch = needs_sampling[i:i + batch_size]
-            tasks = [sample_tender(t) for t in batch]
-            results = await asyncio.gather(*tasks)
-            confirmed.extend([r for r in results if r is not None])
+        # Process all tenders in batches
+        for i in range(0, len(tenders), batch_size):
+            batch = tenders[i:i + batch_size]
 
-            # Small delay between batches
-            if i + batch_size < len(needs_sampling):
-                await asyncio.sleep(1)
+            # Fetch ALL items for each tender in batch (with pagination)
+            tasks = [analyze_tender_items(tender) for tender in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        logger.info(f"📊 Stage 3 Phase 2: {len(needs_sampling)} sampled, {api_calls} API calls")
+            for tender, result in zip(batch, batch_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error analyzing tender {tender.get('numeroControlePNCPCompra')}: {result}")
+                    continue
 
-        # PHASE 3: Auto-approve from confirmed lacre orgs
-        # If we found 2+ lacre tenders from same org, trust remaining tenders from that org
-        org_tender_counts = {}
-        for tender in confirmed:
-            cnpj = self._normalize_cnpj(tender.get('orgaoEntidade', {}).get('cnpj', '') or tender.get('cnpj', ''))
-            org_tender_counts[cnpj] = org_tender_counts.get(cnpj, 0) + 1
+                if result is None:
+                    continue
 
-        # Check tenders that weren't sampled yet
-        confirmed_control_numbers = {t.get('numeroControlePNCPCompra') for t in confirmed if t.get('numeroControlePNCPCompra')}
-        remaining_from_sampling = [t for t in needs_sampling if t.get('numeroControlePNCPCompra') not in confirmed_control_numbers]
+                if result['has_lacres']:
+                    verified_tenders.append({
+                        **tender,
+                        'verification_method': 'full_item_analysis',
+                        'items_analyzed': result['total_items'],
+                        'lacre_items_found': result['lacre_items_count'],
+                        'lacre_items': result['lacre_items'],  # List of matching items
+                        'all_items': result.get('all_items', [])  # Store all items for saving later
+                    })
+                    tenders_with_lacres += 1
+                    logger.info(
+                        f"✅ Found {result['lacre_items_count']} lacre items in "
+                        f"{result['total_items']} total items - {tender.get('numeroControlePNCPCompra')}"
+                    )
 
-        org_approved = 0
-        for tender in remaining_from_sampling:
-            cnpj = self._normalize_cnpj(tender.get('orgaoEntidade', {}).get('cnpj', '') or tender.get('cnpj', ''))
-            if cnpj in org_tender_counts and org_tender_counts[cnpj] >= 2:
-                tender['lacre_confidence'] = 75
-                tender['auto_approved'] = True
-                tender['approval_reason'] = 'org_history'
-                confirmed.append(tender)
-                org_approved += 1
+                items_analyzed += result['total_items']
 
-        if org_approved > 0:
-            logger.info(f"📊 Stage 3 Phase 3: {org_approved} org-approved from lacre organizations")
+            # Respect rate limits
+            await asyncio.sleep(1)
+
+        logger.info(f"✅ Stage 3 complete: {tenders_with_lacres}/{len(tenders)} tenders have lacres")
+        logger.info(f"📊 Analyzed {items_analyzed} total items")
 
         # Update metrics
-        self.metrics.stage3_smart_sampling.tenders_out = len(confirmed)
+        self.metrics.stage3_smart_sampling.tenders_out = len(verified_tenders)
         self.metrics.stage3_smart_sampling.api_calls = api_calls
         self.metrics.stage3_smart_sampling.duration_seconds = (datetime.now() - start_time).total_seconds()
 
-        return confirmed
+        return verified_tenders
+
+    async def _analyze_all_tender_items(self, tender: Dict) -> Dict:
+        """
+        Fetch ALL items for a tender (with pagination) and check each for lacre keywords
+
+        Returns:
+            {
+                'has_lacres': bool,
+                'total_items': int,
+                'lacre_items_count': int,
+                'lacre_items': List[Dict],  # Items that contain lacre keywords
+                'all_items': List[Dict]  # ALL items (for saving to database later)
+            }
+        """
+        # Extract CNPJ from nested structure
+        cnpj = tender.get('orgaoEntidade', {}).get('cnpj', '') or tender.get('cnpj', '')
+        year = tender.get('ano') or tender.get('anoCompra')
+        sequential = tender.get('sequencial') or tender.get('sequencialCompra')
+
+        if not all([cnpj, year, sequential]):
+            return {
+                'has_lacres': False,
+                'total_items': 0,
+                'lacre_items_count': 0,
+                'lacre_items': [],
+                'all_items': []
+            }
+
+        # Fetch ALL items with pagination (uses get_tender_items which has pagination)
+        status, response = await self.api_client.get_tender_items(cnpj, year, sequential)
+
+        if status != 200:
+            logger.warning(f"Failed to fetch items for {cnpj}/{year}/{sequential}: status {status}")
+            return {
+                'has_lacres': False,
+                'total_items': 0,
+                'lacre_items_count': 0,
+                'lacre_items': [],
+                'all_items': []
+            }
+
+        # Extract items from response
+        all_items = response.get('data', []) if isinstance(response, dict) else response
+
+        if not all_items:
+            return {
+                'has_lacres': False,
+                'total_items': 0,
+                'lacre_items_count': 0,
+                'lacre_items': [],
+                'all_items': []
+            }
+
+        # Analyze EVERY item for lacre keywords
+        lacre_items = []
+
+        for item in all_items:
+            if self._item_contains_lacre(item):
+                lacre_items.append({
+                    'numero': item.get('numeroItem'),
+                    'descricao': item.get('descricao', ''),
+                    'quantidade': item.get('quantidade'),
+                    'valorUnitario': item.get('valorUnitarioEstimado'),
+                    'valorTotal': item.get('valorTotalEstimado')
+                })
+
+        return {
+            'has_lacres': len(lacre_items) > 0,
+            'total_items': len(all_items),
+            'lacre_items_count': len(lacre_items),
+            'lacre_items': lacre_items,
+            'all_items': all_items  # Store ALL items for database saving
+        }
+
+    def _item_contains_lacre(self, item: Dict) -> bool:
+        """
+        Check if an item description contains lacre-related keywords
+
+        Returns True if ANY lacre keyword is found in the item description
+        """
+        description = item.get('descricao', '').lower()
+
+        if not description:
+            return False
+
+        # Check if any lacre keyword is present
+        return any(keyword in description for keyword in LACRE_KEYWORDS)
 
     def _analyze_sample_items(self, items: List[Dict]) -> float:
         """
         Analyze sample items for lacre relevance
         Returns confidence score (0-100)
+
+        NOTE: This method is kept for backward compatibility but is NOT used
+        in the new full item analysis approach for lacre detection.
         """
         if not items:
             return 0.0
@@ -568,6 +607,35 @@ class OptimizedLacreDiscovery:
                 saved_count += 1
 
                 logger.debug(f"Saved tender {tender.get('numeroControlePNCP')} to database (ID: {tender_id})")
+
+                # ✅ NEW: Save ALL items with is_lacre flag
+                all_items = tender.get('all_items', [])
+                if all_items:
+                    items_to_save = []
+                    for item in all_items:
+                        # Check if this item is a lacre item
+                        is_lacre = self._item_contains_lacre(item)
+
+                        items_to_save.append({
+                            'tender_id': tender_id,
+                            'item_number': item.get('numeroItem'),
+                            'description': item.get('descricao', ''),
+                            'unit': item.get('unidadeMedida'),
+                            'quantity': item.get('quantidade'),
+                            'estimated_unit_value': item.get('valorUnitarioEstimado'),
+                            'estimated_total_value': item.get('valorTotalEstimado'),
+                            'homologated_unit_value': None,  # Will be updated later if available
+                            'homologated_total_value': None,
+                            'winner_name': None,
+                            'winner_cnpj': None,
+                            'is_lacre': is_lacre  # ✅ CRITICAL: Mark lacre items
+                        })
+
+                    # Save items in batch
+                    if items_to_save:
+                        await self.db_ops.insert_tender_items_batch(items_to_save)
+                        lacre_count = sum(1 for item in items_to_save if item['is_lacre'])
+                        logger.debug(f"Saved {len(items_to_save)} items ({lacre_count} lacre items) for tender {tender_id}")
 
             except Exception as e:
                 logger.error(f"Error saving tender {tender.get('numeroControlePNCP')}: {e}")
