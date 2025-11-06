@@ -23,6 +23,7 @@ from .database_lacre import LacreDatabaseOperations
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class StageMetrics:
     """Metrics for a single processing stage"""
@@ -127,18 +128,21 @@ class OptimizedLacreDiscovery:
         logger.info(f"🔍 Stage 2 complete: {len(quick_filtered)} tenders retained "
                    f"({self.metrics.stage2_quick_filter.reduction_percent:.1f}% filtered out)")
 
-        # STAGE 3: Smart sampling (minimal API calls)
-        sampled = await self._stage3_smart_sampling(quick_filtered)
-        logger.info(f"🎯 Stage 3 complete: {len(sampled)} tenders confirmed via sampling "
+        # STAGE 3: Full item analysis + immediate save (optimized!)
+        sampled = await self._stage3_smart_sampling(quick_filtered, state)
+        logger.info(f"🎯 Stage 3 complete: {len(sampled)} tenders found and saved "
                    f"({self.metrics.stage3_smart_sampling.reduction_percent:.1f}% filtered out)")
 
         # STAGE 4: Full processing
         processed = await self._stage4_full_processing(sampled)
         logger.info(f"⚡ Stage 4 complete: {len(processed)} tenders fully processed")
 
-        # STAGE 5: Save tenders to database
-        saved_count = await self._save_tenders_to_db(processed, state)
-        logger.info(f"💾 Stage 5 complete: {saved_count} tenders saved to database")
+        # STAGE 5: Retry failed saves (most already saved in Stage 3)
+        retry_count = await self._save_tenders_to_db(processed, state)
+        if retry_count > 0:
+            logger.info(f"💾 Stage 5 complete: {retry_count} failed saves retried successfully")
+        else:
+            logger.info(f"💾 Stage 5 complete: All tenders already saved in Stage 3")
 
         # Summary
         logger.info(f"✅ Discovery complete: {self.metrics.total_api_calls} API calls, "
@@ -261,45 +265,88 @@ class OptimizedLacreDiscovery:
 
         return sum(1 for keyword in strong_keywords if keyword in objeto_lower)
 
-    async def _stage3_smart_sampling(self, tenders: List[Dict]) -> List[Dict]:
+    async def _stage3_smart_sampling(self, tenders: List[Dict], state: str) -> List[Dict]:
         """
-        Stage 3: FULL ITEM ANALYSIS (NO SAMPLING - Critical for lacres!)
+        Stage 3: FULL ITEM ANALYSIS + IMMEDIATE SAVE (Optimized!)
 
         ⚠️  CRITICAL DIFFERENCE FROM MEDICAL PROJECT:
         - Medical items: Homogeneous (if 3 items are medical, all 97 are likely medical)
         - Lacre items: Heterogeneous (99 office supplies + 1 lacre = we MUST check all 100)
 
-        Strategy: Fetch ALL items for ALL tenders and analyze each one for lacres
-        This is slower but necessary because lacres can be bundled with unrelated items.
+        🚀 OPTIMIZATION: Save tenders to database IMMEDIATELY when lacre items found
+        - No memory bloat from caching items
+        - Single pass through data
+        - Proactive rate limit management (no surprise 37-minute sleeps!)
         """
         start_time = datetime.now()
         self.metrics.stage3_smart_sampling.tenders_in = len(tenders)
 
-        logger.info(f"📋 Stage 3: Full item analysis for {len(tenders)} tenders")
+        logger.info(f"📋 Stage 3: Full item analysis + immediate save for {len(tenders)} tenders")
         logger.info("⚠️  NO SAMPLING - Analyzing EVERY item to find lacres")
+        logger.info("🚀 OPTIMIZED - Saving to database immediately (no caching)")
 
         verified_tenders = []
         items_analyzed = 0
         tenders_with_lacres = 0
+        saved_count = 0
+        failed_saves = []
+
         api_calls = 0
         api_calls_lock = asyncio.Lock()
 
-        # Process in batches to manage rate limits
+        # Process in batches to manage rate limits (per-minute only, handled by API client)
         batch_size = 5  # Process 5 tenders at a time
         semaphore = asyncio.Semaphore(batch_size)
 
-        async def analyze_tender_items(tender):
-            """Analyze all items for a single tender"""
-            nonlocal api_calls
+        async def analyze_and_save_tender(tender):
+            """Analyze all items for a single tender and save immediately if lacre found"""
+            nonlocal api_calls, saved_count, tenders_with_lacres
 
             async with semaphore:
                 try:
+                    # Fetch and analyze items (rate limiting handled by PNCPAPIClient - per minute only!)
                     result = await self._analyze_all_tender_items(tender)
 
+                    # Record API call
                     async with api_calls_lock:
-                        api_calls += 1  # One API call per tender (with pagination)
+                        api_calls += 1
 
-                    return result
+                    # If lacre items found, save IMMEDIATELY to database
+                    if result['has_lacres']:
+                        try:
+                            await self._save_single_tender_to_db(
+                                tender,
+                                result['all_items'],
+                                state
+                            )
+                            saved_count += 1
+                            tenders_with_lacres += 1
+
+                            logger.info(
+                                f"✅ Found {result['lacre_items_count']} lacre items in "
+                                f"{result['total_items']} total items - SAVED to DB - "
+                                f"{tender.get('numeroControlePNCP')}"
+                            )
+
+                            # Return lightweight tender info (no items cached!)
+                            return {
+                                **tender,
+                                'verification_method': 'full_item_analysis',
+                                'items_analyzed': result['total_items'],
+                                'lacre_items_found': result['lacre_items_count'],
+                                'saved_to_db': True
+                            }
+
+                        except Exception as save_error:
+                            logger.error(f"💾 Failed to save tender {tender.get('numeroControlePNCP')}: {save_error}")
+                            failed_saves.append((tender, result, str(save_error)))
+                            # Return None so we can retry later
+                            return None
+
+                    return {
+                        'items_analyzed': result['total_items'],
+                        'has_lacres': False
+                    }
 
                 except Exception as e:
                     logger.error(f"Error analyzing tender {tender.get('numeroControlePNCPCompra')}: {e}")
@@ -310,45 +357,41 @@ class OptimizedLacreDiscovery:
         for i in range(0, len(tenders), batch_size):
             batch = tenders[i:i + batch_size]
 
-            # Fetch ALL items for each tender in batch (with pagination)
-            tasks = [analyze_tender_items(tender) for tender in batch]
+            # Fetch items + save immediately for each tender in batch
+            tasks = [analyze_and_save_tender(tender) for tender in batch]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for tender, result in zip(batch, batch_results):
                 if isinstance(result, Exception):
-                    logger.error(f"Error analyzing tender {tender.get('numeroControlePNCPCompra')}: {result}")
+                    logger.error(f"Error processing tender {tender.get('numeroControlePNCPCompra')}: {result}")
                     continue
 
                 if result is None:
                     continue
 
-                if result['has_lacres']:
-                    verified_tenders.append({
-                        **tender,
-                        'verification_method': 'full_item_analysis',
-                        'items_analyzed': result['total_items'],
-                        'lacre_items_found': result['lacre_items_count'],
-                        'lacre_items': result['lacre_items'],  # List of matching items
-                        'all_items': result.get('all_items', [])  # Store all items for saving later
-                    })
-                    tenders_with_lacres += 1
-                    logger.info(
-                        f"✅ Found {result['lacre_items_count']} lacre items in "
-                        f"{result['total_items']} total items - {tender.get('numeroControlePNCPCompra')}"
-                    )
+                if result.get('has_lacres', False) and result.get('saved_to_db', False):
+                    verified_tenders.append(result)
 
-                items_analyzed += result['total_items']
+                items_analyzed += result.get('items_analyzed', 0)
 
-            # Respect rate limits
-            await asyncio.sleep(1)
+            # Small delay between batches
+            await asyncio.sleep(0.5)
 
+        # Log results
         logger.info(f"✅ Stage 3 complete: {tenders_with_lacres}/{len(tenders)} tenders have lacres")
+        logger.info(f"💾 Saved {saved_count} tenders to database immediately")
         logger.info(f"📊 Analyzed {items_analyzed} total items")
+
+        if failed_saves:
+            logger.warning(f"⚠️  {len(failed_saves)} tenders failed to save (will retry in Stage 5)")
 
         # Update metrics
         self.metrics.stage3_smart_sampling.tenders_out = len(verified_tenders)
         self.metrics.stage3_smart_sampling.api_calls = api_calls
         self.metrics.stage3_smart_sampling.duration_seconds = (datetime.now() - start_time).total_seconds()
+
+        # Store failed saves for retry in Stage 5
+        self.failed_saves = failed_saves
 
         return verified_tenders
 
@@ -429,15 +472,40 @@ class OptimizedLacreDiscovery:
         """
         Check if an item description contains lacre-related keywords
 
-        Returns True if ANY lacre keyword is found in the item description
+        STRICT RULE: Must contain the word "lacre" or very specific seal terms.
+        This prevents false positives from generic safety/security items like:
+        - "Sapato de segurança" (Safety shoes)
+        - "Botina de segurança" (Safety boots)
+        - "Material de proteção" (Protection equipment)
         """
         description = item.get('descricao', '').lower()
 
         if not description:
             return False
 
-        # Check if any lacre keyword is present
-        return any(keyword in description for keyword in LACRE_KEYWORDS)
+        # STRICT: Must have "lacre" or very specific seal terminology
+        core_lacre_terms = [
+            'lacre', 'lacres',  # Portuguese: seal/seals
+            'selo-lacre', 'lacração',  # Portuguese: seal-lock, sealing
+            'etiqueta void',  # Specific security seal type
+        ]
+
+        # Check for core terms first
+        has_lacre = any(term in description for term in core_lacre_terms)
+
+        if has_lacre:
+            return True
+
+        # Check for "selo" or "seal" with specific context (not generic usage)
+        specific_seal_phrases = [
+            'selo de segurança', 'selo inviolável', 'selo numerado',
+            'security seal', 'tamper evident seal', 'numbered seal',
+            'selo para', 'selo com',  # "seal for", "seal with"
+        ]
+
+        has_specific_seal = any(phrase in description for phrase in specific_seal_phrases)
+
+        return has_specific_seal
 
     def _analyze_sample_items(self, items: List[Dict]) -> float:
         """
@@ -533,10 +601,180 @@ class OptimizedLacreDiscovery:
 
         return processed
 
+    async def _save_single_tender_to_db(self, tender: Dict, all_items: List[Dict], state: str) -> None:
+        """
+        Save a single tender and its items to database immediately
+        Used in Stage 3 for immediate saves (no caching)
+        """
+        # First, ensure organization exists
+        org_data = tender.get('orgaoEntidade', {})
+        cnpj = self._normalize_cnpj(org_data.get('cnpj', ''))
+
+        if not cnpj:
+            raise ValueError(f"Tender {tender.get('numeroControlePNCP')} has no CNPJ")
+
+        # Determine government level
+        gov_level = 'municipal'  # Default
+        org_name = org_data.get('razaoSocial', '').lower()
+        if 'estado' in org_name or 'secretaria de estado' in org_name:
+            gov_level = 'state'
+        elif 'federal' in org_name or 'ministério' in org_name or 'ministerio' in org_name:
+            gov_level = 'federal'
+
+        org_id = await self.db_ops.insert_organization({
+            'cnpj': cnpj,
+            'name': org_data.get('razaoSocial', 'Unknown'),
+            'government_level': gov_level,
+            'organization_type': 'public',
+            'state_code': state
+        })
+
+        # Get year and sequential
+        year = tender.get('ano') or tender.get('anoCompra')
+        sequential = tender.get('sequencial') or tender.get('sequencialCompra')
+
+        # Determine tender size
+        estimated_value = tender.get('valorTotalEstimado', 0) or 0
+        homologated_value = tender.get('valorTotalHomologado', 0) or 0
+        tender_value = max(estimated_value, homologated_value)
+
+        if tender_value < 50_000:
+            tender_size = 'small'
+        elif tender_value < 500_000:
+            tender_size = 'medium'
+        elif tender_value < 5_000_000:
+            tender_size = 'large'
+        else:
+            tender_size = 'mega'
+
+        # Convert publication date string to datetime.date object
+        publication_date = None
+        if tender.get('dataPublicacaoPncp'):
+            try:
+                date_str = tender.get('dataPublicacaoPncp')[:10]  # Get YYYY-MM-DD
+                publication_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Failed to parse date '{tender.get('dataPublicacaoPncp')}': {e}")
+                publication_date = None
+
+        tender_data = {
+            'organization_id': org_id,
+            'cnpj': cnpj,
+            'ano': year,
+            'sequencial': sequential,
+            'control_number': tender.get('numeroControlePNCP'),
+            'title': tender.get('objetoCompra', ''),
+            'description': tender.get('descricao', ''),
+            'government_level': gov_level,
+            'tender_size': tender_size,
+            'contracting_modality': tender.get('modalidadeId'),
+            'modality_name': tender.get('modalidadeNome', ''),
+            'total_estimated_value': estimated_value,
+            'total_homologated_value': homologated_value,
+            'publication_date': publication_date,
+            'state_code': state,
+            'municipality_code': tender.get('codigoIbgeMunicipio'),
+            'status': tender.get('situacaoCompra') or tender.get('situacao') or 'discovered'
+        }
+
+        # Insert tender
+        tender_id = await self.db_ops.insert_tender(tender_data)
+
+        # Save ALL items with is_lacre flag + fetch homologated values if available
+        if all_items:
+            items_to_save = []
+            for item in all_items:
+                # Check if this item is a lacre item
+                is_lacre = self._item_contains_lacre(item)
+
+                # Prepare item data
+                item_data = {
+                    'tender_id': tender_id,
+                    'item_number': item.get('numeroItem'),
+                    'description': item.get('descricao', ''),
+                    'unit': item.get('unidadeMedida'),
+                    'quantity': item.get('quantidade'),
+                    'estimated_unit_value': item.get('valorUnitarioEstimado'),
+                    'estimated_total_value': item.get('valorTotalEstimado'),
+                    'homologated_unit_value': None,
+                    'homologated_total_value': None,
+                    'winner_name': None,
+                    'winner_cnpj': None,
+                    'is_lacre': is_lacre
+                }
+
+                # If item has results, fetch homologated prices (from Medical project logic)
+                if item.get('temResultado', False):
+                    logger.info(f"🔍 Item {item_data['item_number']} has temResultado=True, fetching results...")
+                    try:
+                        result_status, result_response = await self.api_client.get_item_results(
+                            cnpj, year, sequential, item_data['item_number']
+                        )
+
+                        logger.info(f"📊 Results API response: status={result_status}, type={type(result_response)}")
+
+                        if result_status == 200:
+                            # ✅ FIX: Handle both response formats (list or dict with 'data' key)
+                            if isinstance(result_response, list):
+                                results_list = result_response
+                            elif isinstance(result_response, dict):
+                                results_list = result_response.get('data', [])
+                            else:
+                                results_list = []
+
+                            logger.info(f"📦 Extracted {len(results_list)} results from response")
+
+                            # Use first result (winner)
+                            if results_list and len(results_list) > 0:
+                                result = results_list[0]
+                                item_data['homologated_unit_value'] = result.get('valorUnitarioHomologado')
+                                item_data['homologated_total_value'] = result.get('valorTotalHomologado')
+                                item_data['winner_name'] = result.get('nomeRazaoSocialFornecedor')
+                                item_data['winner_cnpj'] = result.get('niFornecedor')
+                                logger.info(f"✅ Saved homologated values: unit={item_data['homologated_unit_value']}, winner={item_data['winner_name']}")
+                            else:
+                                logger.warning(f"⚠️  Results list is empty for item {item_data['item_number']}")
+                        else:
+                            logger.warning(f"❌ Failed to fetch results: status {result_status}")
+
+                    except Exception as e:
+                        logger.warning(f"Could not fetch results for item {item_data['item_number']}: {e}")
+                else:
+                    if is_lacre:
+                        logger.info(f"ℹ️  Lacre item {item_data['item_number']} has temResultado=False (no results available)")
+
+                items_to_save.append(item_data)
+
+            # Save items in batch
+            if items_to_save:
+                await self.db_ops.insert_tender_items_batch(items_to_save)
+                lacre_count = sum(1 for item in items_to_save if item['is_lacre'])
+                homologated_count = sum(1 for item in items_to_save if item['homologated_unit_value'] is not None)
+                logger.debug(f"💾 Saved {len(items_to_save)} items ({lacre_count} lacre, {homologated_count} with results) for tender {tender_id}")
+
     async def _save_tenders_to_db(self, tenders: List[Dict], state: str) -> int:
-        """Save processed tenders to database"""
+        """
+        Save processed tenders to database (Stage 5 - now mainly for retrying failed saves)
+        Most tenders are already saved in Stage 3
+        """
         saved_count = 0
 
+        # Retry any failed saves from Stage 3
+        if hasattr(self, 'failed_saves') and self.failed_saves:
+            logger.info(f"🔄 Retrying {len(self.failed_saves)} failed saves from Stage 3")
+            for tender, result, error in self.failed_saves:
+                try:
+                    await self._save_single_tender_to_db(
+                        tender,
+                        result['all_items'],
+                        state
+                    )
+                    saved_count += 1
+                    logger.info(f"✅ Retry successful for {tender.get('numeroControlePNCP')}")
+                except Exception as e:
+                    logger.error(f"❌ Retry failed for {tender.get('numeroControlePNCP')}: {e}")
+
+        # Process any remaining tenders that weren't saved in Stage 3
         for tender in tenders:
             try:
                 # First, ensure organization exists
@@ -618,7 +856,7 @@ class OptimizedLacreDiscovery:
 
                 logger.debug(f"Saved tender {tender.get('numeroControlePNCP')} to database (ID: {tender_id})")
 
-                # ✅ NEW: Save ALL items with is_lacre flag
+                # ✅ NEW: Save ALL items with is_lacre flag + fetch homologated values if available
                 all_items = tender.get('all_items', [])
                 if all_items:
                     items_to_save = []
@@ -626,7 +864,8 @@ class OptimizedLacreDiscovery:
                         # Check if this item is a lacre item
                         is_lacre = self._item_contains_lacre(item)
 
-                        items_to_save.append({
+                        # Prepare item data
+                        item_data = {
                             'tender_id': tender_id,
                             'item_number': item.get('numeroItem'),
                             'description': item.get('descricao', ''),
@@ -634,18 +873,61 @@ class OptimizedLacreDiscovery:
                             'quantity': item.get('quantidade'),
                             'estimated_unit_value': item.get('valorUnitarioEstimado'),
                             'estimated_total_value': item.get('valorTotalEstimado'),
-                            'homologated_unit_value': None,  # Will be updated later if available
+                            'homologated_unit_value': None,
                             'homologated_total_value': None,
                             'winner_name': None,
                             'winner_cnpj': None,
                             'is_lacre': is_lacre  # ✅ CRITICAL: Mark lacre items
-                        })
+                        }
+
+                        # If item has results, fetch homologated prices (from Medical project logic)
+                        if item.get('temResultado', False):
+                            logger.info(f"🔍 [Stage 5] Item {item_data['item_number']} has temResultado=True, fetching results...")
+                            try:
+                                result_status, result_response = await self.api_client.get_item_results(
+                                    cnpj, year, sequential, item_data['item_number']
+                                )
+
+                                logger.info(f"📊 [Stage 5] Results API response: status={result_status}, type={type(result_response)}")
+
+                                if result_status == 200:
+                                    # ✅ FIX: Handle both response formats (list or dict with 'data' key)
+                                    if isinstance(result_response, list):
+                                        results_list = result_response
+                                    elif isinstance(result_response, dict):
+                                        results_list = result_response.get('data', [])
+                                    else:
+                                        results_list = []
+
+                                    logger.info(f"📦 [Stage 5] Extracted {len(results_list)} results from response")
+
+                                    # Use first result (winner)
+                                    if results_list and len(results_list) > 0:
+                                        result = results_list[0]
+                                        item_data['homologated_unit_value'] = result.get('valorUnitarioHomologado')
+                                        item_data['homologated_total_value'] = result.get('valorTotalHomologado')
+                                        item_data['winner_name'] = result.get('nomeRazaoSocialFornecedor')
+                                        item_data['winner_cnpj'] = result.get('niFornecedor')
+                                        logger.info(f"✅ [Stage 5] Saved homologated values: unit={item_data['homologated_unit_value']}, winner={item_data['winner_name']}")
+                                    else:
+                                        logger.warning(f"⚠️  [Stage 5] Results list is empty for item {item_data['item_number']}")
+                                else:
+                                    logger.warning(f"❌ [Stage 5] Failed to fetch results: status {result_status}")
+
+                            except Exception as e:
+                                logger.warning(f"[Stage 5] Could not fetch results for item {item_data['item_number']}: {e}")
+                        else:
+                            if is_lacre:
+                                logger.info(f"ℹ️  [Stage 5] Lacre item {item_data['item_number']} has temResultado=False (no results available)")
+
+                        items_to_save.append(item_data)
 
                     # Save items in batch
                     if items_to_save:
                         await self.db_ops.insert_tender_items_batch(items_to_save)
                         lacre_count = sum(1 for item in items_to_save if item['is_lacre'])
-                        logger.debug(f"Saved {len(items_to_save)} items ({lacre_count} lacre items) for tender {tender_id}")
+                        homologated_count = sum(1 for item in items_to_save if item['homologated_unit_value'] is not None)
+                        logger.debug(f"Saved {len(items_to_save)} items ({lacre_count} lacre, {homologated_count} with results) for tender {tender_id}")
 
             except Exception as e:
                 logger.error(f"Error saving tender {tender.get('numeroControlePNCP')}: {e}")

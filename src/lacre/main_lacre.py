@@ -27,16 +27,25 @@ from .processed_lacre_tenders_tracker import (
     ProcessedLacreTendersTracker, LacreTenderIdentifier, get_processed_lacre_tenders_tracker
 )
 
-# Configure logging
+# Configure logging with timestamped log file in logs directory
+log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
+os.makedirs(log_dir, exist_ok=True)
+log_filename = f"pncp_lacre_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+log_filepath = os.path.join(log_dir, log_filename)
+
+# Store log filepath globally for run.sh script to access
+os.environ['PNCP_CURRENT_LOG'] = log_filepath
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('pncp_lacre_processing.log'),
+        logging.FileHandler(log_filepath),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+logger.info(f"📝 Log file: {log_filepath}")
 
 class PNCPLacreProcessor:
     """Main orchestration class for PNCP lacre data processing"""

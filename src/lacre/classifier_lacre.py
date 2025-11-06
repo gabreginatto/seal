@@ -203,7 +203,11 @@ class LacreTenderClassifier:
 
     def assess_lacre_relevance(self, tender_title: str, tender_description: str,
                                items_description: str = "") -> Tuple[bool, float, List[str], str]:
-        """Assess if tender is relevant to lacre products"""
+        """Assess if tender is relevant to lacre products
+
+        STRICT RULE: Must contain the word "lacre" or direct synonyms to be considered relevant.
+        This prevents false positives from generic safety/security items.
+        """
 
         combined_text = f"{tender_title} {tender_description} {items_description}".lower()
 
@@ -216,8 +220,25 @@ class LacreTenderClassifier:
         # Combined score with weight on high-relevance keywords
         combined_score = (lacre_score * 0.6) + (high_rel_score * 0.4)
 
-        # Determine relevance - must have "lacre" or related term
-        has_core_term = any(term in combined_text for term in ['lacre', 'selo', 'seal', 'inviolável', 'tamper'])
+        # STRICT: Determine relevance - must have "lacre" or VERY specific seal terms
+        # Removed generic terms like "inviolável", "segurança" that match too many false positives
+        has_core_term = any(term in combined_text for term in [
+            'lacre', 'lacres',  # Portuguese: seal/seals
+            'selo-lacre', 'lacração',  # Portuguese: seal-lock, sealing
+            'etiqueta void',  # Specific security seal type
+        ])
+
+        # For "selo" or "seal" - must be followed by specific context to avoid false positives
+        # (e.g., "selo de segurança" YES, but "segurança" alone NO)
+        if not has_core_term:
+            # Check for "selo/seal" with specific contexts
+            has_specific_seal = any(phrase in combined_text for phrase in [
+                'selo de segurança', 'selo inviolável', 'selo numerado',
+                'security seal', 'tamper evident seal', 'numbered seal',
+                'seal de', 'seal for', 'seals de', 'seals for'
+            ])
+            has_core_term = has_specific_seal
+
         is_relevant = has_core_term and (combined_score >= 15 or high_rel_score >= 10)
 
         all_keywords_found = list(set(lacre_keywords_found + high_rel_keywords))
@@ -228,7 +249,7 @@ class LacreTenderClassifier:
         if lacre_keywords_found:
             reasoning_parts.append(f"Lacre keywords: {lacre_keywords_found[:5]}")
         if not has_core_term:
-            reasoning_parts.append("Missing core lacre terms")
+            reasoning_parts.append("Missing core 'lacre' term - likely false positive")
 
         reasoning = "; ".join(reasoning_parts) if reasoning_parts else "No significant lacre keywords found"
 

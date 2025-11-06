@@ -48,23 +48,21 @@ class AuthToken:
         )
 
 class RateLimiter:
-    """Simple rate limiter for API requests"""
+    """Simple rate limiter for API requests - per minute only (PNCP API has no hourly limit)"""
 
-    def __init__(self, max_requests_per_minute: int = 60, max_requests_per_hour: int = 1000):
+    def __init__(self, max_requests_per_minute: int = 60, max_requests_per_hour: int = None):
         self.max_per_minute = max_requests_per_minute
-        self.max_per_hour = max_requests_per_hour
         self.minute_requests = []
-        self.hour_requests = []
+        # max_requests_per_hour kept for compatibility but ignored
 
     async def wait_if_needed(self):
-        """Wait if rate limits would be exceeded"""
+        """Wait if rate limits would be exceeded (per-minute only)"""
         now = time.time()
 
-        # Clean old requests
+        # Clean old requests (last 60 seconds only)
         self.minute_requests = [req_time for req_time in self.minute_requests if now - req_time < 60]
-        self.hour_requests = [req_time for req_time in self.hour_requests if now - req_time < 3600]
 
-        # Check minute limit
+        # Check minute limit (ONLY limit that exists on PNCP API)
         if len(self.minute_requests) >= self.max_per_minute:
             sleep_time = 60 - (now - self.minute_requests[0])
             if sleep_time > 0:
@@ -72,17 +70,8 @@ class RateLimiter:
                 await asyncio.sleep(sleep_time)
                 return await self.wait_if_needed()
 
-        # Check hour limit
-        if len(self.hour_requests) >= self.max_per_hour:
-            sleep_time = 3600 - (now - self.hour_requests[0])
-            if sleep_time > 0:
-                logger.warning(f"Hourly rate limit reached, sleeping for {sleep_time:.1f} seconds")
-                await asyncio.sleep(sleep_time)
-                return await self.wait_if_needed()
-
         # Record this request
         self.minute_requests.append(now)
-        self.hour_requests.append(now)
 
 class PNCPAPIClient:
     """PNCP API client with authentication and rate limiting"""
@@ -339,7 +328,8 @@ class PNCPAPIClient:
                 if not authenticated:
                     return 401, {'error': 'Authentication failed'}
 
-        url = f"{self.base_url}/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens/{item_number}/resultados"
+        # ✅ FIX: Use correct base URL (/api/pncp/v1/, not /api/consulta/v1/)
+        url = "https://pncp.gov.br/api/pncp/v1/orgaos/{}/compras/{}/{}/itens/{}/resultados".format(cnpj, year, sequential, item_number)
         headers = self._get_auth_headers()
 
         return await self._make_request('GET', url, headers=headers)
