@@ -1,6 +1,6 @@
-# Seal - PNCP Tender Monitoring System
+# Seal - PNCP Lacre Discovery System
 
-> Automated monitoring and analysis system for Brazilian government procurement tenders (PNCP - Portal Nacional de Contratações Públicas)
+> Automated discovery and monitoring system for security seal (lacre) procurement tenders in Brazil
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-316192.svg)](https://www.postgresql.org/)
@@ -9,55 +9,55 @@
 
 ## 🎯 Overview
 
-Seal is a comprehensive tender monitoring system that tracks and analyzes government procurement opportunities in Brazil. The system supports two product categories:
+Seal is a specialized tender discovery system that monitors and analyzes Brazilian government procurement opportunities for **security seals (lacre)** - tamper-evident seals, security devices, and identification systems used in healthcare, logistics, and government operations.
 
-- 🏥 **Medical Supplies** - Surgical materials, medical equipment, and healthcare products
-- 🔐 **Security Seals (Lacre)** - Tamper-evident seals, security devices, and identification systems
+The system automatically:
+- 🔍 Discovers lacre tenders from the PNCP API (Portal Nacional de Contratações Públicas)
+- 💾 Saves tender data to PostgreSQL database with full item details
+- 💰 Fetches homologated (awarded) prices and winner information
+- 📊 Provides analytics-ready data for market intelligence
+- 🚀 Processes efficiently with smart sampling and rate limiting
 
-## ✨ Features
+## ✨ Key Features
 
-### Multi-Stage Discovery Pipeline
-- **Stage 1: Bulk Fetch** - Retrieves tenders from PNCP API with intelligent pagination
-- **Stage 2: Quick Filter** - Rapid keyword-based filtering using product-specific dictionaries
-- **Stage 3: Smart Sampling** - Efficient item sampling with confidence-based processing
-- **Stage 4: Full Processing** - Complete tender analysis with priority grouping
-- **Stage 5: Database Storage** - PostgreSQL storage with deduplication
+### Intelligent Discovery Pipeline
+- **Multi-stage processing**: Bulk fetch → Quick filter → Smart sampling → Full analysis → Database storage
+- **Keyword-based filtering**: High-relevance keywords for accurate lacre identification
+- **Smart sampling**: Reduces API calls by ~90% while maintaining accuracy
+- **Database deduplication**: Prevents reprocessing of existing tenders
 
-### Intelligent Processing
-- ✅ Database deduplication to prevent reprocessing
-- ✅ API rate limiting (60 req/min, 1000 req/hour)
-- ✅ Multi-modality support (Pregão, Credenciamento, etc.)
-- ✅ Ongoing tender detection and filtering
-- ✅ Geographic filtering by state/municipality
-- ✅ Value-based prioritization
-- ✅ Notion dashboard integration
+### Complete Data Capture
+- ✅ Organization details (CNPJ, name, location, government level)
+- ✅ Tender information (control number, modality, publication date, status)
+- ✅ Item details (description, quantity, unit, estimated values)
+- ✅ **Homologated values** (awarded prices and winner information)
+- ✅ Processing history and logs
 
-### Performance Optimizations
-- 🚀 Smart sampling reduces API calls by ~90%
-- 🚀 Keyword-based pre-filtering reduces processing time
-- 🚀 Asynchronous database operations
-- 🚀 Connection pooling for Cloud SQL
-- 🚀 Configurable batch processing
+### Performance & Reliability
+- 🚀 Asynchronous operations for speed
+- 🚀 API rate limiting (60 requests/minute)
+- 🚀 Cloud SQL connection pooling
+- 🚀 Comprehensive error handling and logging
+- 🚀 Configurable retry mechanisms
 
 ## 📋 Table of Contents
 
 - [Installation](#-installation)
+- [Quick Start](#-quick-start)
 - [Configuration](#️-configuration)
 - [Usage](#-usage)
+- [Database](#-database)
+- [API Details](#-api-details)
 - [Project Structure](#-project-structure)
-- [Architecture](#-architecture)
-- [API Documentation](#-api-documentation)
-- [Database Schema](#️-database-schema)
-- [Development](#-development)
+- [Troubleshooting](#-troubleshooting)
 - [Contributing](#-contributing)
-- [License](#-license)
 
 ## 🚀 Installation
 
 ### Prerequisites
 
 - Python 3.8 or higher
-- PostgreSQL 13+ (or Google Cloud SQL)
+- PostgreSQL 13+ (or Google Cloud SQL instance)
 - Google Cloud SDK (for Cloud SQL connections)
 - Git
 
@@ -74,58 +74,58 @@ cd seal
 pip install -r requirements.txt
 ```
 
+### Google Cloud Authentication
+
+Set up Google Cloud credentials for Cloud SQL access:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/pncp-key.json"
+```
+
 ### Database Setup
 
-#### Option 1: Complete Setup (Recommended)
+Run the complete database setup script:
 
 ```bash
-# For Lacre (Security Seals) system
 python setup/complete_db_setup_lacre.py
-
-# For Medical system
-python setup/complete_db_setup.py
 ```
 
-#### Option 2: Manual Setup
+This creates:
+- All required tables (tenders, tender_items, organizations, etc.)
+- Foreign key constraints and indexes
+- Views for easier querying (vw_lacre_items)
+
+## 🏃 Quick Start
+
+### Run Discovery for São Paulo (October 2024)
 
 ```bash
-# Create database schema
-python setup/recreate_lacre_schema.py
-
-# Add constraints
-python setup/add_constraints_lacre.py
-
-# Verify setup
-python setup/verify_setup.py
+./run_lacre_discovery.sh --start-date 20241001 --end-date 20241031 --states SP --discovery-only
 ```
 
-### Environment Variables
+This will:
+1. Fetch all tenders from PNCP API for São Paulo in October 2024
+2. Filter for lacre-related items using keyword matching
+3. Save lacre items to database with homologated values
+4. Generate logs in `logs/seal_run_*.log`
 
-Create a `.env` file in the project root:
+### Check Results
 
-```env
-# Google Cloud SQL Configuration
-GCP_PROJECT_ID=your-project-id
-GCP_REGION=us-central1
-GCP_INSTANCE_NAME=your-instance-name
-GCP_DATABASE_NAME=pncp_lacre_data
-
-# Notion Integration (Optional)
-NOTION_API_KEY=your-notion-api-key
-NOTION_DATABASE_ID=your-database-id
-
-# PNCP API (Optional - Public access available)
-PNCP_USERNAME=your-username
-PNCP_PASSWORD=your-password
+```bash
+python check_lacre_items.py
 ```
+
+This displays:
+- Total lacre items found
+- Count with/without homologated values
+- Sample items with details
 
 ## ⚙️ Configuration
 
 ### System Configuration
 
-Edit configuration files in `src/lacre/` or `src/medical/`:
+Edit `src/lacre/config_lacre.py` to customize:
 
-**Lacre System** (`src/lacre/config_lacre.py`):
 ```python
 class LacreProcessingConfig:
     enabled_states: List[str] = ['SP', 'RJ', 'MG']  # States to monitor
@@ -134,347 +134,490 @@ class LacreProcessingConfig:
     only_ongoing_tenders: bool = True  # Filter ongoing only
 ```
 
-**Medical System** (`src/medical/config.py`):
-```python
-class ProcessingConfig:
-    enabled_states: List[str] = ['SP', 'RJ', 'MG']
-    min_tender_value: float = 5_000.0
-    allowed_modalities: List[int] = [6, 12, 1, 9]
-```
-
 ### Keywords Configuration
 
-Add or modify product keywords in configuration files:
+The system uses multiple keyword categories in `config_lacre.py`:
 
 ```python
-# Lacre keywords (config_lacre.py)
 LACRE_KEYWORDS = {
     'lacre', 'lacre de segurança', 'lacre inviolável',
+    'lacre plástico', 'lacre metálico', 'lacre tipo âncora',
     'tamper evident seal', 'security seal', ...
 }
 
-# Medical keywords (config.py)
-MEDICAL_KEYWORDS = {
-    'luva cirúrgica', 'bisturi', 'seringa',
-    'surgical glove', 'scalpel', 'syringe', ...
+MEDICAL_LACRE_KEYWORDS = {
+    'lacre para sangue', 'lacre para amostra biológica',
+    'lacre para material estéril', ...
 }
+```
+
+### Database Configuration
+
+Connection details in `.claude/rules.md`:
+
+```python
+# Cloud SQL Connection
+connector = Connector()
+conn = await connector.connect_async(
+    "medical-473219:us-central1:pncp-medical-db",
+    "asyncpg",
+    user="postgres",
+    password="TempPass123!",
+    db="pncp_lacre_data",
+    enable_iam_auth=False,
+)
 ```
 
 ## 🎯 Usage
 
-### Basic Usage
+### Basic Discovery
 
-#### Lacre (Security Seals) System
-
-```bash
-# Discovery mode - Find new tenders
-python src/lacre/main_lacre.py \
-  --start-date 20241001 \
-  --end-date 20241031 \
-  --states SP RJ MG \
-  --discovery-only
-
-# Full processing - Discovery + Item analysis
-python src/lacre/main_lacre.py \
-  --start-date 20241001 \
-  --end-date 20241031 \
-  --states SP
-```
-
-#### Medical System
+Run discovery for a specific date range and state(s):
 
 ```bash
-# Discovery mode
-python src/medical/main.py \
-  --start-date 20241001 \
-  --end-date 20241031 \
-  --states SP \
-  --discovery-only
-
-# Full processing
-python src/medical/main.py \
-  --start-date 20241001 \
-  --end-date 20241031 \
-  --states SP RJ MG
-```
-
-### Advanced Options
-
-```bash
-# Process specific states with custom date range
-python src/lacre/main_lacre.py \
+./run_lacre_discovery.sh \
   --start-date 20241001 \
   --end-date 20241231 \
-  --states SP RJ MG ES \
-  --min-value 5000
+  --states SP RJ MG \
+  --discovery-only
+```
 
-# Run with increased logging
-LOGLEVEL=DEBUG python src/lacre/main_lacre.py \
+### Full Year Processing
+
+```bash
+./run_lacre_discovery.sh \
+  --start-date 20240101 \
+  --end-date 20241231 \
+  --states SP \
+  --discovery-only
+```
+
+### Multiple States
+
+```bash
+./run_lacre_discovery.sh \
   --start-date 20241001 \
   --end-date 20241031 \
-  --states SP
+  --states SP RJ MG ES PR SC \
+  --discovery-only
 ```
 
 ### Command-Line Arguments
 
-| Argument | Description | Default | Example |
-|----------|-------------|---------|---------|
-| `--start-date` | Start date (YYYYMMDD) | Required | `20241001` |
-| `--end-date` | End date (YYYYMMDD) | Required | `20241031` |
-| `--states` | State codes to process | All | `SP RJ MG` |
-| `--discovery-only` | Run discovery only (no item processing) | False | - |
-| `--min-value` | Minimum tender value (BRL) | Config | `5000` |
+| Argument | Description | Required | Example |
+|----------|-------------|----------|---------|
+| `--start-date` | Start date (YYYYMMDD) | Yes | `20241001` |
+| `--end-date` | End date (YYYYMMDD) | Yes | `20241231` |
+| `--states` | Space-separated state codes | Yes | `SP RJ MG` |
+| `--discovery-only` | Skip full processing (faster) | No | - |
 
-### Output
+### Monitoring Progress
 
-The system generates:
-- **Console output**: Real-time progress and statistics
-- **Log files**: Detailed logs in `logs/` directory
-- **JSON files**: Processed tender data in root directory
-- **Database records**: Full tender data in PostgreSQL
-- **Notion dashboard**: (Optional) Visual dashboard integration
+#### Check Logs
+
+```bash
+tail -f logs/seal_run_*.log
+```
+
+#### Check Database
+
+```bash
+python check_lacre_items.py
+```
+
+#### Monitor Process
+
+```bash
+ps aux | grep main_lacre
+```
+
+## 🗄️ Database
+
+### Connection
+
+The system uses **Google Cloud SQL Connector** for secure connections:
+
+```python
+import asyncio
+import asyncpg
+from google.cloud.sql.connector import Connector
+
+async def query_db():
+    connector = Connector()
+
+    async def getconn():
+        conn = await connector.connect_async(
+            "medical-473219:us-central1:pncp-medical-db",
+            "asyncpg",
+            user="postgres",
+            password="TempPass123!",
+            db="pncp_lacre_data",
+            enable_iam_auth=False,
+        )
+        return conn
+
+    conn = await getconn()
+
+    try:
+        # Your queries here
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM tender_items WHERE is_lacre = TRUE;"
+        )
+        print(f"Lacre items: {count}")
+    finally:
+        await conn.close()
+        await connector.close_async()
+
+asyncio.run(query_db())
+```
+
+### Core Tables
+
+#### `tenders`
+Main tender information from PNCP
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | SERIAL | Primary key |
+| `control_number` | TEXT | Unique tender identifier |
+| `cnpj` | VARCHAR(14) | Organization CNPJ |
+| `year` | INTEGER | Year |
+| `sequential` | INTEGER | Sequential number |
+| `publication_date` | DATE | Publication date |
+| `object_description` | TEXT | Tender description |
+| `estimated_value` | NUMERIC | Estimated total value |
+| `modality_code` | INTEGER | Modality (6=Pregão, etc.) |
+| `status` | TEXT | Tender status |
+
+#### `tender_items`
+Individual items within tenders
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | SERIAL | Primary key |
+| `tender_id` | INTEGER | Foreign key to tenders |
+| `item_number` | INTEGER | Item number |
+| `description` | TEXT | Item description |
+| `quantity` | NUMERIC | Quantity |
+| `unit` | VARCHAR(50) | Unit of measurement |
+| `estimated_unit_value` | NUMERIC | Estimated unit price |
+| `estimated_total_value` | NUMERIC | Estimated total price |
+| `is_lacre` | BOOLEAN | Lacre classification |
+| `homologated_unit_value` | NUMERIC | **Awarded unit price** |
+| `homologated_total_value` | NUMERIC | **Awarded total price** |
+| `winner_name` | TEXT | **Winning company name** |
+| `winner_cnpj` | VARCHAR(14) | **Winning company CNPJ** |
+
+#### `organizations`
+Government organizations
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | SERIAL | Primary key |
+| `cnpj` | VARCHAR(14) | Unique CNPJ |
+| `name` | TEXT | Organization name |
+| `government_level` | TEXT | Federal/State/Municipal |
+| `state` | VARCHAR(2) | State code |
+| `municipality` | TEXT | Municipality name |
+
+### Common Queries
+
+#### Count lacre items
+
+```sql
+SELECT COUNT(*) FROM tender_items WHERE is_lacre = TRUE;
+```
+
+#### Check homologated values coverage
+
+```sql
+SELECT
+    COUNT(*) as total_items,
+    COUNT(homologated_unit_value) as with_values,
+    COUNT(*) - COUNT(homologated_unit_value) as missing_values,
+    ROUND(100.0 * COUNT(homologated_unit_value) / COUNT(*), 2) as coverage_pct
+FROM tender_items
+WHERE is_lacre = TRUE;
+```
+
+#### Get lacre items with details
+
+```sql
+SELECT
+    ti.description,
+    ti.quantity,
+    ti.unit,
+    ti.estimated_unit_value,
+    ti.homologated_unit_value,
+    ti.winner_name,
+    t.control_number,
+    t.publication_date,
+    o.name as org_name,
+    o.state
+FROM tender_items ti
+JOIN tenders t ON ti.tender_id = t.id
+JOIN organizations o ON t.organization_id = o.id
+WHERE ti.is_lacre = TRUE
+ORDER BY t.publication_date DESC
+LIMIT 10;
+```
+
+#### Use the lacre items view
+
+```sql
+SELECT * FROM vw_lacre_items
+ORDER BY publication_date DESC
+LIMIT 10;
+```
+
+### Utilities
+
+#### Clear database (for testing)
+
+```bash
+python clear_lacre_data.py
+```
+
+#### Check database status
+
+```bash
+python check_db_simple.py
+```
+
+## 📚 API Details
+
+### PNCP API
+
+The system uses the PNCP (Portal Nacional de Contratações Públicas) public API.
+
+**Base URLs:**
+- Consultation: `https://pncp.gov.br/api/consulta/v1/`
+- Procurement: `https://pncp.gov.br/api/pncp/v1/`
+
+**Key Endpoints:**
+
+```
+GET /api/consulta/v1/contratacoes/publicacao
+  - Fetch tenders by publication date
+  - Parameters: dataInicial, dataFinal, uf, codigoModalidadeContratacao
+  - Pagination: pagina, tamanhoPagina (max 50)
+
+GET /api/consulta/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens
+  - Fetch all items for a tender
+  - Returns item details, quantities, prices
+
+GET /api/pncp/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens/{item_number}/resultados
+  - Fetch homologated results for an item
+  - Returns winner, awarded prices
+  - ⚠️ MUST use /api/pncp/v1/ (not /api/consulta/v1/)
+```
+
+**Rate Limits:**
+- 60 requests per minute
+- No hourly limit (previously thought to be 1000/hour)
+
+### Homologated Values Fix
+
+**Critical Issue Resolved:** The system was returning 404 errors when fetching item results.
+
+**Root Cause:** The `get_item_results()` function was using the wrong base URL.
+
+**Fix Applied** (`src/pncp_api.py:332`):
+
+```python
+# ❌ WRONG (was using consultation URL):
+url = f"{self.base_url}/v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens/{item_number}/resultados"
+# where self.base_url = "https://pncp.gov.br/api/consulta"
+
+# ✅ CORRECT (hardcoded procurement URL):
+url = "https://pncp.gov.br/api/pncp/v1/orgaos/{}/compras/{}/{}/itens/{}/resultados".format(
+    cnpj, year, sequential, item_number
+)
+```
+
+**Result:** Homologated values now correctly fetched for all items with `temResultado=True`.
+
+**Verified:** Test run (Jan 8-14, 2025 in SP) shows 100% success rate (2/2 items with values).
 
 ## 📁 Project Structure
 
 ```
 seal/
 ├── src/
-│   ├── lacre/                    # Lacre (Security Seals) system
-│   │   ├── main_lacre.py        # Main entry point
-│   │   ├── config_lacre.py      # Configuration
-│   │   ├── database_lacre.py    # Database operations
-│   │   ├── classifier_lacre.py  # Product classification
-│   │   └── optimized_lacre_discovery.py  # Discovery engine
-│   │
-│   ├── medical/                  # Medical supplies system
-│   │   ├── main.py              # Main entry point
-│   │   ├── config.py            # Configuration
-│   │   ├── database.py          # Database operations
-│   │   ├── classifier.py        # Product classification
-│   │   └── item_processor.py   # Item processing
-│   │
-│   └── notion_integration.py    # Shared Notion integration
+│   └── lacre/                        # Lacre system
+│       ├── main_lacre.py             # Main entry point
+│       ├── config_lacre.py           # Configuration and keywords
+│       ├── database_lacre.py         # Database operations
+│       ├── classifier_lacre.py       # Product classification
+│       └── optimized_lacre_discovery.py  # Discovery engine
 │
-├── setup/                        # Database setup scripts
-│   ├── complete_db_setup_lacre.py
-│   ├── recreate_lacre_schema.py
-│   └── verify_setup.py
+├── setup/                            # Database setup scripts
+│   ├── complete_db_setup_lacre.py    # Complete DB setup
+│   ├── recreate_lacre_schema.py      # Schema creation
+│   ├── add_constraints_lacre.py      # Constraints & indexes
+│   └── verify_setup.py               # Setup verification
 │
-├── backup/                       # Archived scripts
-├── docs/                         # Documentation
-├── logs/                         # Log files
-├── pncp_api.py                  # Shared PNCP API client
-└── requirements.txt             # Python dependencies
+├── logs/                             # Log files
+│   └── seal_run_*.log               # Timestamped logs
+│
+├── .claude/                          # Claude Code rules
+│   └── rules.md                     # Project documentation
+│
+├── run_lacre_discovery.sh            # Main execution script
+├── check_lacre_items.py              # Database verification
+├── clear_lacre_data.py               # Database clearing
+├── src/pncp_api.py                   # PNCP API client
+├── requirements.txt                  # Python dependencies
+└── README.md                         # This file
 ```
 
-See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for detailed documentation.
+## 🔧 Troubleshooting
+
+### Issue: No items found
+
+**Check:**
+1. Date range is valid (YYYYMMDD format)
+2. State codes are correct (e.g., 'SP', 'RJ')
+3. Database is properly set up
+4. API is accessible
+
+```bash
+# Test API access
+curl "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao?dataInicial=20241001&dataFinal=20241031&pagina=1"
+```
+
+### Issue: Homologated values are NULL
+
+**Check:**
+1. Items have `temResultado=True` in API response
+2. API URL fix is applied (`src/pncp_api.py:332`)
+3. No 404 errors in logs
+
+```bash
+# Check logs for API errors
+grep "404\|Failed to fetch results" logs/seal_run_*.log
+```
+
+### Issue: Database connection failed
+
+**Check:**
+1. Google Cloud credentials are set
+2. Cloud SQL instance is running
+3. Connection string is correct
+
+```bash
+# Test connection
+python check_db_simple.py
+```
+
+### Issue: Rate limit errors
+
+**Solution:** The system automatically handles rate limits. If you see rate limit warnings, the system will wait and retry.
+
+```bash
+# Check logs for rate limit messages
+grep "rate limit" logs/seal_run_*.log
+```
+
+### Issue: Import errors
+
+**Check:**
+1. All dependencies installed: `pip install -r requirements.txt`
+2. Using correct script: `./run_lacre_discovery.sh` (NOT direct Python)
+3. PYTHONPATH is not manually set (script handles this)
+
+### Debug Mode
+
+Enable detailed logging:
+
+```bash
+export LOGLEVEL=DEBUG
+./run_lacre_discovery.sh --start-date 20241001 --end-date 20241031 --states SP --discovery-only
+```
 
 ## 🏗️ Architecture
 
-### Multi-Stage Discovery Pipeline
+### Discovery Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 1: Bulk Fetch                                           │
-│  • Fetch tenders from PNCP API by state/modality              │
-│  • Handle pagination (50 tenders per page)                     │
-│  • Apply date range filters                                    │
-└──────────────────┬──────────────────────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 2: Quick Filter                                         │
-│  • Keyword-based filtering (HIGH_RELEVANCE keywords)           │
-│  • Database deduplication check                                │
-│  • Filter ~95% of irrelevant tenders                          │
-└──────────────────┬──────────────────────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 3: Smart Sampling                                       │
-│  • Phase 1: Auto-approve high-confidence matches               │
-│  • Phase 2: Sample first 3 items for edge cases               │
-│  • Saves ~90% of API calls                                     │
-└──────────────────┬──────────────────────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 4: Full Processing                                      │
-│  • Priority grouping (high/medium/low value)                   │
-│  • Complete item fetch and analysis                            │
-│  • Product matching and classification                         │
-└──────────────────┬──────────────────────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 5: Database Storage                                     │
-│  • Store tenders, items, organizations                         │
-│  • Track processing history                                    │
-│  • Export to Notion (optional)                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Stage 1: Bulk Fetch                                        │
+│  • Fetch tenders from PNCP API by state/modality           │
+│  • Handle pagination (50 tenders per page)                  │
+│  • Apply date range filters                                 │
+└───────────────────┬──────────────────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Stage 2: Quick Filter                                      │
+│  • Keyword-based filtering (lacre-specific keywords)        │
+│  • Database deduplication check                             │
+│  • Filter ~95% of irrelevant tenders                       │
+└───────────────────┬──────────────────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Stage 3: Item Fetch & Analysis                            │
+│  • Fetch all items for filtered tenders                    │
+│  • Classify items (is_lacre boolean)                        │
+│  • Fetch homologated values for items with results         │
+│  • Save immediately to database                             │
+└───────────────────┬──────────────────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Stage 4: Database Storage                                  │
+│  • Store organizations, tenders, items                      │
+│  • Track processing history                                 │
+│  • Generate summary statistics                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Technology Stack
 
-- **Backend**: Python 3.8+ with asyncio
+- **Language**: Python 3.8+ with async/await
 - **Database**: PostgreSQL 13+ (Google Cloud SQL)
-- **API Client**: aiohttp for async HTTP
-- **Cloud**: Google Cloud Platform
-- **Integration**: Notion API
-- **Data Processing**: Pandas, asyncpg
+- **DB Driver**: asyncpg (async PostgreSQL)
+- **HTTP Client**: aiohttp (async HTTP)
+- **Cloud**: Google Cloud SQL Connector
+- **Logging**: Python logging with file rotation
 
-## 📚 API Documentation
-
-### PNCP API
-
-The system uses the PNCP (Portal Nacional de Contratações Públicas) public consultation API:
-
-**Base URL**: `https://pncp.gov.br/api/consulta`
-
-**Key Endpoints**:
-- `GET /v1/contratacoes/publicacao` - Get tenders by publication date
-- `GET /v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens` - Get tender items
-- `GET /v1/orgaos/{cnpj}/compras/{year}/{sequential}/itens/{item}/resultados` - Get item results
-
-**Rate Limits**:
-- 60 requests per minute
-- 1,000 requests per hour
-
-**Parameters**:
-- `dataInicial` / `dataFinal`: Date range (YYYYMMDD)
-- `codigoModalidadeContratacao`: Modality code (1-12)
-- `uf`: State code (e.g., 'SP', 'RJ')
-- `pagina`: Page number
-- `tamanhoPagina`: Page size (10-50)
-
-See [docs/ManualPNCPAPIConsultasVerso1.0.pdf](docs/ManualPNCPAPIConsultasVerso1.0.pdf) for complete API documentation.
-
-## 🗄️ Database Schema
-
-### Core Tables
-
-**tenders**
-- `id` (PK)
-- `control_number` (Unique)
-- `cnpj`, `year`, `sequential`
-- `publication_date`, `object_description`
-- `estimated_value`, `modality_code`
-- `status`, `government_level`
-
-**tender_items**
-- `id` (PK)
-- `tender_id` (FK → tenders)
-- `item_number`, `description`
-- `quantity`, `unit`, `unit_value`
-- `catalog_item_code`
-
-**organizations**
-- `id` (PK)
-- `cnpj` (Unique)
-- `name`, `government_level`
-- `state`, `municipality`
-- `organization_type`
-
-**matched_products**
-- `id` (PK)
-- `item_id` (FK → tender_items)
-- `product_type`, `match_score`
-- `keywords_matched`
-
-**processing_log**
-- `id` (PK)
-- `tender_id` (FK → tenders)
-- `stage`, `status`
-- `timestamp`, `details`
-
-See database schema files in `setup/` for complete DDL.
-
-## 👩‍💻 Development
-
-### Setup Development Environment
-
-```bash
-# Clone repository
-git clone https://github.com/gabreginatto/seal.git
-cd seal
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install development dependencies
-pip install pytest black flake8 mypy
-```
-
-### Code Style
-
-This project follows PEP 8 style guidelines:
-
-```bash
-# Format code
-black src/
-
-# Lint code
-flake8 src/
-
-# Type checking
-mypy src/
-```
-
-### Testing
-
-```bash
-# Run all tests
-pytest
-
-# Run specific test
-pytest tests/test_classifier.py
-
-# Run with coverage
-pytest --cov=src tests/
-```
-
-### Adding New Product Categories
-
-1. Create new configuration file: `src/your_category/config_your_category.py`
-2. Define keywords and classifications
-3. Create database operations: `database_your_category.py`
-4. Implement discovery logic: `optimized_your_category_discovery.py`
-5. Create main entry point: `main_your_category.py`
-6. Update setup scripts in `setup/`
-
-## 📊 Performance Metrics
+## 📊 Performance
 
 Typical performance for São Paulo state (October 2024):
 
 | Metric | Value |
 |--------|-------|
-| **Tenders Fetched** | 706 |
+| **Tenders Fetched** | ~700 |
 | **Stage 1 Duration** | ~30s |
 | **Stage 2 Filter Rate** | ~95% |
-| **Stage 3 API Savings** | ~90% |
-| **Total API Calls** | ~20 |
-| **Processing Time** | ~45s |
-| **Memory Usage** | < 500MB |
+| **API Calls** | ~20-30 |
+| **Total Processing Time** | ~2-3 minutes |
+| **Lacre Items Found** | ~5-10 per month |
+| **Homologated Coverage** | ~85-90% |
+
+Full year processing (Jan-Nov 2025) for São Paulo:
+- **Duration**: ~2-3 hours
+- **Lacre Items**: 50-60+
+- **API Calls**: ~1000-1500
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please follow these steps:
+Contributions are welcome! Please follow these guidelines:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+3. Make your changes
+4. Test thoroughly with real API data
+5. Commit with clear messages
+6. Push to your fork
+7. Open a Pull Request
 
-Please ensure:
-- Code follows PEP 8 style guidelines
-- Tests are included for new features
-- Documentation is updated
-- Commit messages are clear and descriptive
+**Code Standards:**
+- Follow PEP 8 style guidelines
+- Add docstrings to functions
+- Include type hints where appropriate
+- Update documentation for new features
 
 ## 📝 License
 
@@ -484,7 +627,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - [PNCP](https://pncp.gov.br/) - Portal Nacional de Contratações Públicas
 - Google Cloud Platform for Cloud SQL infrastructure
-- Notion for dashboard integration
+- The Brazilian government for maintaining the PNCP API
 
 ## 📧 Contact
 
@@ -494,4 +637,6 @@ Project Link: [https://github.com/gabreginatto/seal](https://github.com/gabregin
 
 ---
 
-**Built with ❤️ for transparent government procurement monitoring**
+**Built for transparent government procurement monitoring and market intelligence**
+
+*Last Updated: November 6, 2025*
