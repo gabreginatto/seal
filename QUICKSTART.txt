@@ -1,0 +1,72 @@
+================================================================================
+SEAL - LACRE DISCOVERY QUICKSTART
+================================================================================
+
+START THE SCRIPT (from Seal directory):
+----------------------------------------
+./run_lacre_discovery.sh --start-date 20251001 --end-date 20251031 --states SP --discovery-only
+
+CHECK IF RUNNING:
+-----------------
+ps aux | grep "python main.py" | grep -v grep
+
+MONITOR LOGS:
+-------------
+tail -f logs/pncp_lacre_*.log
+
+CHECK FOR RATE LIMITING ISSUES:
+--------------------------------
+grep "Rate limit" logs/pncp_lacre_*.log
+# Should see max 60 second sleeps, NOT 2394 seconds (40 minutes)
+
+KILL PROCESS:
+-------------
+kill <PID>
+
+================================================================================
+WHAT WENT WRONG (4-5 failed startup attempts):
+================================================================================
+
+❌ WRONG: python src/lacre/main_lacre.py
+   Error: ImportError: attempted relative import with no known parent package
+
+❌ WRONG: python -m src.lacre.main_lacre
+   Error: ModuleNotFoundError: No module named 'config'
+
+✅ CORRECT: python main.py
+   Reason: main.py sets up sys.path correctly before importing
+
+KEY LESSON: Always use main.py as entry point, not internal modules!
+
+================================================================================
+STARTUP ARCHITECTURE:
+================================================================================
+
+Seal/
+├── main.py                    ✓ Correct entry point (sets up Python path)
+├── run_lacre_discovery.sh     ✓ Wrapper script (recommended)
+├── src/
+│   ├── config.py
+│   ├── lacre/
+│   │   ├── main_lacre.py      ✗ Cannot run directly (relative imports)
+│   │   └── config_lacre.py
+
+MUST:
+- Run from Seal directory
+- Use main.py entry point
+- Set GOOGLE_APPLICATION_CREDENTIALS
+
+================================================================================
+RATE LIMITING FIX APPLIED:
+================================================================================
+
+✅ FIXED: Removed artificial hourly rate limits
+   - Removed from src/pncp_api.py (lines 50-85)
+   - Removed RateLimitTracker class from src/lacre/optimized_lacre_discovery.py
+
+✅ NOW: Only per-minute rate limiting (60 req/min, max 60 sec sleep)
+❌ BEFORE: Hourly rate limit causing 40-minute (2394 sec) sleeps
+
+PNCP API has NO hourly limits (confirmed by Medical project)
+
+================================================================================
